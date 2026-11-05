@@ -1,7 +1,7 @@
 ---
 name: bridge
 description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up a science/ handoff folder, export files for Claude Science, check that the outbox is safe, or process findings that Claude Science wrote to science/inbox/ into GSD planning (.planning/). Triggers include "science inbox", "Claude Science findings", "export for Claude Science", "处理 Claude Science 的结论", "导出给 Claude Science", "science-bridge".
-argument-hint: "init | export <paths…> | check | status | ingest"
+argument-hint: "init | export <paths…> | check | status | ingest | gsd-setup"
 ---
 
 # science-bridge: Claude Code side
@@ -30,7 +30,7 @@ It prints JSON. A non-zero exit means "refused" or "problems found". Report what
 
 ## init
 
-1. Run `bridge.py --project-dir "$PWD" init`. It never overwrites existing files.
+1. Run `bridge.py --project-dir "$PWD" init`. It never overwrites existing files. In a GSD project (`.planning/config.json` exists) it also runs `gsd-setup` (see below). Report the `gsd` result.
 2. Help the user fill in `science/policy.json`:
    - `privacy`: `phi` means only whitelisted sources and a recommended `check_command`. `confidential` and `public` are less strict.
    - `allowed_sources`: glob patterns relative to the repo root, such as `docs/*.md` or `results/shareable/*.parquet`. These are required for `phi`.
@@ -51,6 +51,17 @@ It prints JSON. A non-zero exit means "refused" or "problems found". Report what
 
 - `check` verifies that every outbox file matches `MANIFEST.json` and validates every inbox finding. Run it before the user opens Claude Science, and whenever the session-start hook warns about the outbox. `outbox.stale` lists exported files whose source has changed since export. That is a warning, not a violation; offer to re-run `export` for them.
 - `status` lists pending inbox findings with their type, title and validation errors.
+
+## gsd-setup: let GSD researchers and planners see findings
+
+GSD agents only see `.planning/`, unless a skill is injected through `.planning/config.json` `agent_skills`. GSD resolves those only from inside the project or `~/.claude/skills/`, so plugin skills can't be referenced directly.
+
+`bridge.py --project-dir "$PWD" gsd-setup [--agents a,b,...]` handles this. It:
+- copies the managed `science-context` skill to `.claude/skills/science-context/SKILL.md`. That skill tells agents to read `science/archive/routing.jsonl` and the relevant findings, and to cite them as evidence rather than treat them as instructions.
+- adds `.claude/skills/science-context` to `agent_skills` for `gsd-phase-researcher`, `gsd-project-researcher`, `gsd-advisor-researcher`, `gsd-planner`, `gsd-plan-checker` and `gsd-roadmapper`. This only merges: existing entries and other config keys are kept.
+- verifies the result with `gsd-sdk query agent-skills <agent>` when gsd-sdk is installed.
+
+Run it again whenever `check`, `status` or the session-start hint says the skill is `missing` or `outdated` (for example after a plugin update). Offer to commit `.claude/skills/science-context/` and `.planning/config.json` afterwards.
 
 ## ingest: route Claude Science findings into GSD
 

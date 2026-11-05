@@ -224,6 +224,73 @@ class BridgeFlow(unittest.TestCase):
         self.assertEqual(code, 0, out)
 
 
+class GsdIntegration(unittest.TestCase):
+    def setUp(self):
+        self._which = bridge.shutil.which
+        bridge.shutil.which = lambda name: None  # don't call the real gsd-sdk from unit tests
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / ".planning").mkdir()
+        self.cfg_path = self.root / ".planning" / "config.json"
+        self.cfg_path.write_text(json.dumps({
+            "mode": "yolo",
+            "agent_skills": {"gsd-planner": [".claude/skills/house-style"], "gsd-executor": "global:lint"},
+            "workflow": {"research": True},
+        }, indent=2))
+
+    def tearDown(self):
+        bridge.shutil.which = self._which
+
+    def cfg(self):
+        return json.loads(self.cfg_path.read_text())
+
+    def test_gsd_setup_requires_gsd_project(self):
+        plain = Path(tempfile.mkdtemp())
+        run(["--project-dir", str(plain), "init"])
+        code, out = run(["--project-dir", str(plain), "gsd-setup"])
+        self.assertEqual(code, 1)
+        self.assertIn(".planning/config.json", out["error"])
+
+    def test_init_runs_gsd_setup_and_merges_without_clobbering(self):
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("installed", out["gsd"]["skill"])
+        skill = self.root / ".claude" / "skills" / "science-context" / "SKILL.md"
+        self.assertEqual(skill.read_bytes(), bridge.GSD_SKILL_TEMPLATE.read_bytes())
+        cfg = self.cfg()
+        self.assertEqual(cfg["mode"], "yolo")
+        self.assertEqual(cfg["workflow"], {"research": True})
+        self.assertEqual(cfg["agent_skills"]["gsd-planner"], [".claude/skills/house-style", ".claude/skills/science-context"])
+        self.assertEqual(cfg["agent_skills"]["gsd-executor"], "global:lint", "agents not in the list must be untouched")
+        for agent in bridge.GSD_DEFAULT_AGENTS:
+            self.assertIn(".claude/skills/science-context", cfg["agent_skills"][agent])
+
+        code, out = run(["--project-dir", str(self.root), "gsd-setup"])
+        self.assertEqual(out["agents_added"], [])
+        self.assertIn("unchanged", out["skill"])
+        self.assertEqual(self.cfg()["agent_skills"]["gsd-planner"].count(".claude/skills/science-context"), 1)
+
+    def test_no_gsd_flag_and_custom_agents(self):
+        code, out = run(["--project-dir", str(self.root), "init", "--no-gsd"])
+        self.assertTrue(str(out["gsd"]).startswith("skipped"))
+        self.assertNotIn("gsd-phase-researcher", self.cfg()["agent_skills"])
+        code, out = run(["--project-dir", str(self.root), "gsd-setup", "--agents", "gsd-verifier"])
+        self.assertEqual(out["agents_added"], ["gsd-verifier"])
+        code, out = run(["--project-dir", str(self.root), "gsd-setup", "--agents", "bad agent;rm"])
+        self.assertEqual(code, 1)
+
+    def test_outdated_skill_is_reported_and_refreshed(self):
+        run(["--project-dir", str(self.root), "init"])
+        skill = self.root / ".claude" / "skills" / "science-context" / "SKILL.md"
+        skill.write_text("old version")
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertEqual(out["gsd"]["skill"], "outdated")
+        code, out = run(["--project-dir", str(self.root), "gsd-setup"])
+        self.assertIn("updated", out["skill"])
+        code, out = run(["--project-dir", str(self.root), "check"])
+        self.assertEqual(out["gsd"]["skill"], "current")
+        self.assertEqual(out["gsd"]["agents_missing"], [])
+
+
 class SessionHint(unittest.TestCase):
     def hint(self, cwd):
         proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "bridge.py"), "session-hint"],
@@ -245,6 +312,13 @@ class SessionHint(unittest.TestCase):
         out = self.hint(root / "src")
         self.assertIn("1 Claude Science finding(s) waiting", out)
         self.assertIn("WARNING: science/outbox", out)
+
+    def test_reports_missing_gsd_skill_in_gsd_project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".planning").mkdir()
+        (root / ".planning" / "config.json").write_text("{}")
+        run(["--project-dir", str(root), "init", "--no-gsd"])
+        self.assertIn("science-context skill is missing", self.hint(root))
 
 
 if __name__ == "__main__":

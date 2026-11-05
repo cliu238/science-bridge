@@ -14,6 +14,11 @@ Commands:
   status                            list pending inbox findings with validation results (JSON)
   archive FILE --route R --ref TXT  move a routed finding (and its inbox attachments) to
                                     science/archive/ and append to archive/routing.jsonl
+  gsd-setup [--agents a,b,...]      GSD integration: install the science-context skill at
+                                    .claude/skills/science-context/ and add it to
+                                    .planning/config.json agent_skills for researcher/planner
+                                    agents (merge only; existing entries are kept). `init` runs
+                                    this automatically when .planning/config.json exists.
   session-hint                      for the SessionStart hook: print a one-line reminder when
                                     there is something to act on; otherwise print nothing.
                                     Always exits 0.
@@ -41,6 +46,10 @@ TEMPLATES = PLUGIN_ROOT / "templates"
 sys.path.insert(0, str(PLUGIN_ROOT / "skills" / "science-findings" / "scripts"))
 from check_finding import validate_finding  # noqa: E402
 
+GSD_SKILL_TEMPLATE = TEMPLATES / "gsd" / "science-context" / "SKILL.md"
+GSD_SKILL_ENTRY = ".claude/skills/science-context"
+GSD_DEFAULT_AGENTS = ("gsd-phase-researcher", "gsd-project-researcher", "gsd-advisor-researcher",
+                      "gsd-planner", "gsd-plan-checker", "gsd-roadmapper")
 MANIFEST_FORMAT = "science-bridge-manifest/v0.1"
 PRIVACY_LEVELS = ("phi", "confidential", "public")
 ROUTES = ("note", "todo", "seed", "manual", "rejected")
@@ -153,16 +162,104 @@ def cmd_init(args: argparse.Namespace) -> int:
     if not manifest.exists():
         save_manifest(root, {"format": MANIFEST_FORMAT, "files": []})
         created.append(str(manifest.relative_to(root)))
+    gsd = None
+    if not args.no_gsd and (root / ".planning" / "config.json").is_file():
+        gsd = gsd_setup(root, list(GSD_DEFAULT_AGENTS))
     _emit({
         "ok": True,
         "project": str(root),
         "created": created,
+        "gsd": gsd if gsd is not None else "skipped (no .planning/config.json or --no-gsd)",
         "next_steps": [
             "Edit science/policy.json (privacy level, allowed_sources, check_command).",
             "Edit science/README.md (project brief for Claude Science).",
             "In Claude Science: grant ONLY the science/ folder, and import the science-findings skill.",
         ],
     })
+    return 0
+
+
+# ---------------------------------------------------------------- GSD integration
+
+def _gsd_skill_state(root: Path) -> str:
+    dst = root / GSD_SKILL_ENTRY / "SKILL.md"
+    if not dst.is_file():
+        return "missing"
+    return "current" if dst.read_bytes() == GSD_SKILL_TEMPLATE.read_bytes() else "outdated"
+
+
+def gsd_report(root: Path) -> Dict[str, Any]:
+    cfg_path = root / ".planning" / "config.json"
+    if not cfg_path.is_file():
+        return {"planning": False}
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return {"planning": True, "error": ".planning/config.json is not valid JSON"}
+    skills = cfg.get("agent_skills") or {}
+    configured = []
+    for agent, val in skills.items():
+        vals = [val] if isinstance(val, str) else (val if isinstance(val, list) else [])
+        if GSD_SKILL_ENTRY in vals:
+            configured.append(agent)
+    return {"planning": True, "skill": _gsd_skill_state(root), "agents_configured": sorted(configured),
+            "agents_missing": [a for a in GSD_DEFAULT_AGENTS if a not in configured]}
+
+
+def gsd_setup(root: Path, agents: List[str]) -> Dict[str, Any]:
+    cfg_path = root / ".planning" / "config.json"
+    if not cfg_path.is_file():
+        raise BridgeError("no .planning/config.json; gsd-setup needs a GSD project (run /gsd-new-project first)")
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise BridgeError(".planning/config.json is not valid JSON: %s" % e)
+    for a in agents:
+        if not a or not all(c.isalnum() or c in "-_" for c in a):
+            raise BridgeError("invalid agent type %r" % a)
+
+    dst = root / GSD_SKILL_ENTRY / "SKILL.md"
+    state = _gsd_skill_state(root)
+    if state != "current":
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(GSD_SKILL_TEMPLATE), str(dst))
+    skill_status = {"missing": "installed", "outdated": "updated", "current": "unchanged"}[state]
+
+    skills = cfg.get("agent_skills")
+    if not isinstance(skills, dict):
+        skills = {}
+    added = []
+    for agent in agents:
+        val = skills.get(agent)
+        vals = [val] if isinstance(val, str) else (list(val) if isinstance(val, list) else [])
+        if GSD_SKILL_ENTRY not in vals:
+            vals.append(GSD_SKILL_ENTRY)
+            added.append(agent)
+        skills[agent] = vals
+    cfg["agent_skills"] = skills
+    if added:
+        tmp = cfg_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(cfg_path))
+
+    verified: Optional[bool] = None
+    sdk = shutil.which("gsd-sdk")
+    if sdk and agents:
+        try:
+            proc = subprocess.run([sdk, "query", "agent-skills", agents[0]], cwd=str(root),
+                                  capture_output=True, text=True, timeout=60)
+            verified = GSD_SKILL_ENTRY + "/SKILL.md" in proc.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            verified = None
+    return {"skill": "%s/SKILL.md (%s)" % (GSD_SKILL_ENTRY, skill_status), "agents_added": added,
+            "agents": agents, "gsd_sdk_verified": verified}
+
+
+def cmd_gsd_setup(args: argparse.Namespace) -> int:
+    root = require_project(args.project_dir)
+    agents = [a.strip() for a in args.agents.split(",") if a.strip()] if args.agents else list(GSD_DEFAULT_AGENTS)
+    result = gsd_setup(root, agents)
+    _emit({"ok": True, **result})
     return 0
 
 
@@ -319,7 +416,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     invalid = [f for f in inb["findings"] if not f["ok"]]
     ok = not out["violations"] and not invalid
     _emit({"ok": ok, "outbox": out, "inbox": {"pending": len(inb["findings"]), "invalid": len(invalid),
-                                               "findings": inb["findings"], "attachments": inb["attachments"]}})
+                                               "findings": inb["findings"], "attachments": inb["attachments"]},
+           "gsd": gsd_report(root)})
     return 0 if ok else 1
 
 
@@ -335,6 +433,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "pending": [{"file": Path(f["file"]).name, "ok": f["ok"], "errors": f["errors"], **f["meta"]}
                     for f in inb["findings"]],
         "attachments": inb["attachments"],
+        "gsd": gsd_report(root),
     })
     return 0
 
@@ -400,6 +499,11 @@ def cmd_session_hint(args: argparse.Namespace) -> int:
             lines.append("[science-bridge] science/inbox has %d Claude Science finding(s) waiting%s. "
                          "Run /science-bridge:bridge ingest to route them into GSD."
                          % (len(pending), " (%d invalid)" % invalid if invalid else ""))
+        gsd = gsd_report(root)
+        if gsd.get("planning") and gsd.get("skill") in ("missing", "outdated"):
+            lines.append("[science-bridge] GSD agents' science-context skill is %s. Run "
+                         "/science-bridge:bridge gsd-setup so researchers/planners see Claude Science findings."
+                         % gsd["skill"])
         if lines:
             print("\n".join(lines))
     except Exception:  # never break session start
@@ -413,7 +517,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="bridge.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--project-dir", default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init")
+    p = sub.add_parser("init")
+    p.add_argument("--no-gsd", action="store_true", help="don't run gsd-setup even if .planning/ exists")
+    p = sub.add_parser("gsd-setup")
+    p.add_argument("--agents", default=None, help="comma-separated GSD agent types (default: researchers + planners)")
     p = sub.add_parser("export")
     p.add_argument("paths", nargs="+")
     sub.add_parser("check")
@@ -425,7 +532,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("session-hint")
     args = ap.parse_args(argv)
     handlers = {"init": cmd_init, "export": cmd_export, "check": cmd_check, "status": cmd_status,
-                "archive": cmd_archive, "session-hint": cmd_session_hint}
+                "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup}
     try:
         return handlers[args.cmd](args)
     except BridgeError as e:
