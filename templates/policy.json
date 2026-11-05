@@ -1,0 +1,8 @@
+{
+  "policy_version": 1,
+  "privacy": "phi",
+  "allowed_sources": [],
+  "allowed_extensions": [".md", ".csv", ".tsv", ".json", ".png", ".svg", ".pdf", ".docx", ".parquet", ".txt"],
+  "check_command": null,
+  "max_file_mb": 50
+}

@@ -1,0 +1,14 @@
+{
+  "name": "science-bridge-marketplace",
+  "description": "science-bridge: Claude Code ↔ Claude Science handoff for GSD projects",
+  "owner": {
+    "name": "cliu238"
+  },
+  "plugins": [
+    {
+      "name": "science-bridge",
+      "source": "./",
+      "description": "Policy-checked outbox, validated findings inbox, and GSD routing for Claude Science collaboration"
+    }
+  ]
+}
