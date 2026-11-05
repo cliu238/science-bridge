@@ -73,6 +73,8 @@ This creates `science/{outbox,inbox,archive}`, `science/README.md` and `science/
 
 | key | meaning |
 |-----|---------|
+| `access` | `repo-readonly` (default): Claude Science reads the whole repo read-only, so it can check what was already done. `science-only`: it sees only `science/` and only reads exported files |
+| `do_not_read` | glob patterns Claude Science must never open, e.g. `"prereg/sealed_fold_record.yaml"` |
 | `privacy` | `phi` (patient data anywhere in the project), `confidential` or `public` |
 | `allowed_sources` | glob whitelist relative to the repo root, e.g. `".planning/research/*.md"`, `"results/summary/*.csv"`. Required for `phi`. Only files matching it can be exported |
 | `allowed_extensions` | file types allowed in the outbox |
@@ -85,26 +87,32 @@ This creates `science/{outbox,inbox,archive}`, `science/README.md` and `science/
 - what is in the outbox;
 - which requirement IDs (from `.planning/REQUIREMENTS.md`) findings should cite in `affects`.
 
-**4. Export the first files.**
+**4. Queue the first questions.** Exporting is only needed for files outside the repo; with `repo-readonly`, Claude Science reads repo files where they are.
 
 ```
-/science-bridge:bridge export .planning/research/SUMMARY.md docs/protocol.md
+/science-bridge:bridge ask "Literature review of X" --affects "REQ-01"
 ```
+
+This appends `SQ-001` to `.planning/research/questions.md` → `## For Claude Science`. GSD researchers and planners add their own questions there during planning.
 
 Exports are all-or-nothing. A file outside the whitelist refuses the whole batch.
 
 **5. Set up Claude Science.**
 1. Create a **new project**, one per GSD project.
 2. In the project instructions, paste something like the box below.
-3. Grant **only** that project's `science/` folder: Files › Artifacts › *Add folder…* › choose `.../<project>/science` › **Read & write** › *Grant this folder*.
+3. Grant two folders under Files › Artifacts › *Add folder…*:
+   - the **repo root**, **Read-only**;
+   - `<repo>/science`, **Read & write**.
 
-> Always use the science-findings skill. Work only inside the granted science/ folder: read science/README.md and science/policy.json first, use only files listed in science/outbox/MANIFEST.json, and write results only to science/inbox/ as findings in the science-finding/v0.1 format, validated with the skill's scripts/check_finding.py. Privacy level is <phi|confidential|public>: never request, read, or quote patient- or case-level data. Cite a source for every number, and say when evidence is weak.
+   For `science-only` projects, grant just `science/`.
+
+> Always use the science-findings skill. Read science/policy.json and science/README.md first. You may read the whole repo read-only (code, .planning/, git log) except do_not_read paths, and before every task run the skill's duplicate-work check so nothing already done is repeated. Write only to science/inbox/, as findings in the science-finding/v0.1 format validated with the skill's scripts/check_finding.py; never edit code or .planning/ and never commit. Answer queued SQ requests with `answers: [SQ-NNN]`. Cite a source for every number, and say when evidence is weak.
 
 **6. Commit.** Commit `science/`, `.claude/skills/science-context/` and `.planning/config.json`.
 
 ### C. Everyday loop
 
-1. **Ask Claude Science for something** in its project, e.g. "按 science/README.md 做任务 1". It writes findings plus attachments into `science/inbox/` and validates them.
+1. **Ask Claude Science** in its project to "process the open SQ requests", or give it a task directly. It first checks what the project already has, then writes findings plus attachments into `science/inbox/` and validates them. `/science-bridge:bridge requests` lists open questions; the session-start hint shows how many are open.
 2. **Open Claude Code in the project.** The session-start hint says `science/inbox has N finding(s) waiting`.
 3. **Route them with `/science-bridge:bridge ingest`.** It shows a routing plan and asks for confirmation:
    - `finding`, `literature`, `rule-check` and `question` become a note;
@@ -112,7 +120,7 @@ Exports are all-or-nothing. A file outside the whitelist refuses the whole batch
    - forward-looking items become a seed;
    - conflicts with decisions are left to you.
 
-   It then archives the finding into `science/archive/` and logs the route in `routing.jsonl`.
+   It then archives the finding into `science/archive/`, logs the route in `routing.jsonl`, and ticks the SQ items listed in the finding's `answers`.
 4. **Plan as usual.** During `/gsd-discuss-phase`, `/gsd-plan-phase` and `/gsd-new-milestone`, the injected `science-context` skill makes the researcher and planner agents read `science/archive/routing.jsonl` and the relevant findings, then cite them in research and plans.
 5. **Re-export changed files** whenever `check` reports `stale` outbox copies.
 

@@ -1,5 +1,7 @@
 {
-  "policy_version": 1,
+  "policy_version": 2,
+  "access": "repo-readonly",
+  "do_not_read": [],
   "privacy": "phi",
   "allowed_sources": [],
   "allowed_extensions": [".md", ".csv", ".tsv", ".json", ".png", ".svg", ".pdf", ".docx", ".parquet", ".txt"],

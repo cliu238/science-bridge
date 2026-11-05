@@ -1,7 +1,7 @@
 ---
 name: bridge
 description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up a science/ handoff folder, export files for Claude Science, check that the outbox is safe, or process findings that Claude Science wrote to science/inbox/ into GSD planning (.planning/). Triggers include "science inbox", "Claude Science findings", "export for Claude Science", "处理 Claude Science 的结论", "导出给 Claude Science", "science-bridge".
-argument-hint: "init | export <paths…> | check | status | ingest | gsd-setup"
+argument-hint: "init | ask <question> | requests | check | status | ingest | gsd-setup | export <paths…>"
 ---
 
 # science-bridge: Claude Code side
@@ -51,6 +51,14 @@ It prints JSON. A non-zero exit means "refused" or "problems found". Report what
 
 - `check` verifies that every outbox file matches `MANIFEST.json` and validates every inbox finding. Run it before the user opens Claude Science, and whenever the session-start hook warns about the outbox. `outbox.stale` lists exported files whose source has changed since export. That is a warning, not a violation; offer to re-run `export` for them.
 - `status` lists pending inbox findings with their type, title and validation errors.
+
+## requests / ask: the question queue for Claude Science
+
+Open questions for Claude Science live in `.planning/research/questions.md`, under `## For Claude Science`, as `SQ-NNN` items. GSD researchers and planners add their own questions there.
+- `bridge.py --project-dir "$PWD" requests [--all]` lists the open items, or all items with `--all`.
+- `bridge.py --project-dir "$PWD" ask "<question>" [--by "<who>"] [--context "<paths>"] [--affects "<IDs>"]` appends a new item with the next number, and refuses duplicates.
+
+Claude Science answers with findings that set `answers: [SQ-NNN]`. `archive` ticks those items automatically. When the user wants Claude Science to work on the queue, tell them to say "process the open SQ requests" in Claude Science.
 
 ## gsd-setup: let GSD researchers and planners see findings
 

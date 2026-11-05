@@ -1,30 +1,30 @@
 # Science handoff: <project name>
 
-This folder is the only place this project and **Claude Science** exchange files. The format is `science-finding/v0.1`, defined in the science-findings skill under `references/format.md`.
+This project works with **Claude Science** through this `science/` folder (science-bridge, format `science-finding/v0.1`, see the science-findings skill's `references/format.md`).
 
-- `outbox/` holds files approved for Claude Science to read. Only `bridge.py export` writes here, and `MANIFEST.json` lists every file.
-- `inbox/` is where Claude Science writes its findings, one markdown file each.
-- `archive/` holds findings that have been routed into the project's GSD planning (`.planning/`), plus `routing.jsonl`.
+- **Access** (see `policy.json`): `repo-readonly`. Claude Science may read the whole repo, read-only: code, `.planning/`, git history. The exceptions are paths in `do_not_read`.
+- `inbox/` is the only place Claude Science writes: one markdown finding per file, validated.
+- `archive/` holds findings already routed into `.planning/`, plus `routing.jsonl`.
+- **Request queue:** `.planning/research/questions.md` → `## For Claude Science` (SQ-NNN items).
+- `outbox/` is optional, for files that live outside the repo. Only `bridge.py export` writes there.
 
 ## Rules for Claude Science
 
-1. You are granted this `science/` folder only. Don't ask for access to the rest of the repo.
-2. Read only what is in `outbox/`, and treat it as read-only.
-3. Write findings only to `inbox/`, in the required format. Run the skill's `scripts/check_finding.py` on each one before you finish.
-4. Never include patient- or case-level data in a finding. Privacy level for this project: **<phi | confidential | public>**.
-5. Suggest actions in `## Suggested action`. Never try to edit the project's planning files.
+1. Before every task, run the duplicate-work check from the skill: archive and inbox, then `.planning/`, the code and `git log`. Build on what exists, and don't redo it.
+2. Write only to `inbox/`. Never edit code or `.planning/`, and never commit.
+3. Never open `do_not_read` paths.
+4. No patient- or case-level data in findings.
+5. Answer queued questions with findings that set `answers: [SQ-NNN]`.
 
 ## Project brief
 
-<!-- Fill in. Keep it short. Claude Science reads this first. -->
+<!-- Fill in. Keep it short. -->
 
 **What the project is:** <one paragraph>
 
-**What we want from Claude Science:**
-- <task 1>
-- <task 2>
+**What we want from Claude Science:** see the request queue, plus:
+- <standing task, if any>
 
-**What is in the outbox:**
-- <file or group of files>: <what it is>
+**Where things are:** <key code / data / docs paths>
 
-**Requirement / decision IDs to reference in `affects`:** <e.g. LBL-01, MET-05>
+**Requirement IDs to reference in `affects`:** see `.planning/REQUIREMENTS.md`, e.g. <IDs>

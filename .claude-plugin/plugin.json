@@ -1,6 +1,6 @@
 {
   "name": "science-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "File-based handoff between Claude Code (+ GSD) projects and Claude Science: a policy-checked outbox, a validated findings inbox, and routing of findings into .planning/.",
   "author": {
     "name": "cliu238"

@@ -4,7 +4,7 @@ description: For GSD agents (researchers, planners, checkers) in a project that 
 disable-model-invocation: true
 ---
 
-<!-- Managed by science-bridge (template science-context v1). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
+<!-- Managed by science-bridge (template science-context v2). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
 
 # Claude Science findings in this project
 
@@ -20,6 +20,24 @@ If the project has no `science/` folder, ignore this skill.
 4. **Use them as evidence and cite them.** Cite as `science/archive/<file>` with its `type` and `confidence`. On the same question, prefer a relevant finding over your own unverified assumption. If your research contradicts a finding, say so explicitly, give your evidence, and flag it for the user. Don't silently override it.
 5. **Planners: keep the link.** When a plan task implements something a finding proposed, put the finding path in the task's context or sources. That way the executor and verifier can trace why the task exists.
 6. **Mention unrouted findings, but don't rely on them.** If `science/inbox/` holds unrouted findings, report their count and titles as "pending, unreviewed".
+
+## Ask Claude Science when you hit a question you can't settle
+
+Claude Science can't be called from here. A person carries questions to it, and it can read this repo read-only. When your work raises a question that needs expert scientific work, add it to the request queue. Examples of such work:
+- a literature search;
+- a domain-rule or guideline check;
+- a statistics or design review;
+- an analysis on data you can't run.
+
+To add a question:
+1. Open `.planning/research/questions.md` and find the `## For Claude Science` section. If it is missing, add it at the end of the file.
+2. Check that the question isn't already listed, open or answered. If it was answered, use that finding instead.
+3. Append one line at the end of that section. Use the next free number:
+
+   `- [ ] SQ-NNN (YYYY-MM-DD, <your agent type> phase <N>): <the question, self-contained> — context: <repo paths>; affects: <requirement IDs>`
+4. **Don't wait for the answer.** Continue with an explicit assumption, and mark it in your output as "pending SQ-NNN". Answers arrive as findings with `answers: [SQ-NNN]`, and the next research or planning round picks them up.
+
+Add questions only for real gaps. Don't add one for anything you can settle with your own tools.
 
 ## Limits
 

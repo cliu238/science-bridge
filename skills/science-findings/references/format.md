@@ -5,22 +5,47 @@ This document defines the shared handoff format between a Claude Code (+ GSD) pr
 ## Folder layout (inside the project repo)
 
 ```
-science/
-├── README.md        project brief for Claude Science (written by the project owner)
-├── policy.json      machine-readable privacy and export rules
-├── outbox/          project → Claude Science. Written only by `bridge.py export`.
-│   └── MANIFEST.json  every exported file: name, sha256, bytes, source, exported_at
-├── inbox/           Claude Science → project. One markdown finding per file.
-└── archive/         findings already routed into GSD, plus routing.jsonl
+<repo>/
+├── science/
+│   ├── README.md        project brief for Claude Science (written by the project owner)
+│   ├── policy.json      access mode, privacy level, export rules, do_not_read list
+│   ├── outbox/          optional: files from OUTSIDE the repo, written only by `bridge.py export`
+│   │   └── MANIFEST.json  every exported file: name, sha256, bytes, source, exported_at
+│   ├── inbox/           Claude Science → project. One markdown finding per file.
+│   └── archive/         findings already routed into GSD, plus routing.jsonl
+└── .planning/research/questions.md
+                         contains "## For Claude Science": the request queue (SQ-NNN items)
 ```
 
-Claude Science is granted the `science/` folder only, never the repo root.
+## Access modes (`policy.json` → `access`)
+
+| `access` | What Claude Science is granted | What it may read | Where it may write |
+|----------|--------------------------------|------------------|--------------------|
+| `repo-readonly` (default) | the repo root **read-only**, plus `science/` **read & write** | everything in the repo (code, `.planning/`, git history) except paths matching `do_not_read` | `science/inbox/` only |
+| `science-only` | `science/` only | only files listed in `outbox/MANIFEST.json` | `science/inbox/` only |
+
+`do_not_read` is a list of glob patterns, relative to the repo root, that Claude Science must never open, whatever the mode. Example: a sealed pre-registration fold.
 
 ## Outbox rules
 
+The outbox is mainly for files that live outside the repo. In `repo-readonly` mode Claude Science reads repo files where they are.
 - Every file in `outbox/` (except `MANIFEST.json` and `.gitkeep`) must be listed in `MANIFEST.json` with a matching sha256. Any other file is a violation, and `bridge.py check` fails on it.
 - Files enter the outbox only through `bridge.py export`, which applies `policy.json`.
 - Claude Science treats the outbox as read-only.
+
+## Request queue (`.planning/research/questions.md` → `## For Claude Science`)
+
+GSD agents or the user record questions for Claude Science here, one per line:
+
+```markdown
+- [ ] SQ-001 (2026-11-06, gsd-phase-researcher phase 3): Do AJCC 8 oral-cavity tables have the same merged-label offset? — context: HNC-staging-document/ca_oral_cavity.docx; affects: LBL-01, LBL-06
+- [x] SQ-002 (2026-11-05, user): Literature review of LLM TNM staging — answered: science/archive/2026-11-06-llm-staging-literature.md
+```
+
+Rules:
+- IDs are `SQ-` followed by at least three digits. Each new item takes the next free number.
+- Before adding an item, check that the same question isn't already listed.
+- Claude Science answers an item with a finding whose frontmatter has `answers: [SQ-001]`. When that finding is archived, `bridge.py archive` ticks the item and appends ` — answered: <archive path>`.
 
 ## Finding files (inbox)
 
@@ -28,9 +53,9 @@ Claude Science is granted the `science/` folder only, never the repo root.
 
 **Size:** 200 KB at most per finding.
 
-**Attachments:** a large table or a figure goes in a separate file next to the finding, for example `inbox/2026-11-06-ajcc-larynx-stage-groups.csv`. List it in `sources` as `inbox/<name>`. When the finding is archived, its listed attachments move with it. Attachments follow the same privacy rule as findings.
+**Attachments:** a large table or a figure goes in a separate file next to the finding, for example `inbox/2026-11-06-ajcc-larynx-stage-groups.csv`. List it in `sources` as `inbox/<name>`. When the finding is archived, its listed attachments move with it.
 
-**Frontmatter (required):**
+**Frontmatter:**
 
 ```yaml
 ---
@@ -41,10 +66,14 @@ created: 2026-11-06
 author: claude-science
 confidence: medium
 sources:
-  - outbox/ca_larynx.docx
+  - HNC-staging-document/ca_larynx.docx
   - https://pubmed.ncbi.nlm.nih.gov/00000000/
 contains_case_data: false
 affects: [LBL-01, LBL-06]
+answers: [SQ-001]
+builds_on:
+  - science/archive/2026-11-05-ajcc8-larynx-labels-and-stage-groups.md
+  - .planning/research/PITFALLS.md
 provenance: "Claude Science project 'stagebench', artifact 'larynx_groups.csv' v2"
 ---
 ```
@@ -57,16 +86,18 @@ provenance: "Claude Science project 'stagebench', artifact 'larynx_groups.csv' v
 | `created` | yes | `YYYY-MM-DD` |
 | `author` | yes | who wrote it (`claude-science` or a person) |
 | `confidence` | yes | `high`, `medium`, `low` |
-| `sources` | yes | non-empty list of outbox paths and/or URLs |
+| `sources` | yes | non-empty list of repo paths, outbox paths and/or URLs |
 | `contains_case_data` | yes | must be `false` |
 | `affects` | no | list of requirement IDs, phase names or decision names |
+| `answers` | no | list of request IDs (`SQ-NNN`) this finding answers |
+| `builds_on` | no | list of existing work it builds on: repo paths, archived findings. Expected whenever the duplicate-work check found related work |
 | `provenance` | no | a Claude Science artifact/version reference, so numbers can be traced |
 
 What each `type` means:
 
 | Type | Meaning | Default GSD route |
 |------|---------|-------------------|
-| `finding` | a result from analysing outbox data | note |
+| `finding` | a result from analysing project data, code or documents | note |
 | `literature` | a summary of published work | note |
 | `rule-check` | a check of domain rules or guidelines | note (flagged if it conflicts with a decision) |
 | `analysis-proposal` | an analysis worth implementing in project code | todo |
@@ -76,22 +107,40 @@ What each `type` means:
 
 ```markdown
 ## Summary
-Two to five sentences. Lead with the conclusion.
+Two to five sentences. Lead with the conclusion. Say what was already known in the project
+(see builds_on) and what is new in this finding.
 
 ## Details
-Evidence, tables, reasoning. Cite the sources and the outbox file each number comes from.
+Evidence, tables, reasoning. Cite the source (repo path, URL, or artifact) of every number.
 
 ## Suggested action
 What the project should do, e.g. "add a todo to implement X" or "update requirement LBL-01".
-Claude Science suggests; it never edits project planning files itself.
+Claude Science suggests; it never edits project code or planning files itself.
 ```
+
+## Duplicate-work check (required before every task)
+
+Before starting work, Claude Science checks whether the work was already done. It looks in, in this order:
+
+1. `science/archive/` (with `routing.jsonl`) and `science/inbox/`: earlier findings.
+2. `.planning/`, especially:
+   - `PROJECT.md`, `REQUIREMENTS.md`, `ROADMAP.md`, `STATE.md`;
+   - `research/` (including `questions.md`);
+   - `phases/*/` (`*-RESEARCH.md`, `*-PLAN.md`, `*-SUMMARY.md`, `*-CONTEXT.md`);
+   - `notes/`, `todos/`.
+3. The code: is the analysis already implemented, tested, or decided against?
+4. `git log` (recent commits): what changed recently.
+
+Depending on what it finds:
+- **Already fully covered:** don't redo it. Write a short `finding` that points to where the work is (in `builds_on`) and what, if anything, is still missing.
+- **Partly covered:** build on it, and list it in `builds_on`. The Summary must separate what was known from what is new.
 
 ## Privacy
 
 - `contains_case_data: false` is mandatory. A finding must never quote patient-level text such as report sentences, identifiers or dates of individual cases.
-- If an analysis would need case-level data, write a `question` finding that explains what is needed. Don't request or read that data.
-- Under `policy.json` `"privacy": "phi"`, the only data Claude Science may use is what is in `outbox/`.
+- Never open paths matching `do_not_read`.
+- Under `"access": "science-only"`, the only data Claude Science may use is what is listed in `outbox/MANIFEST.json`.
 
 ## Versioning
 
-The format string is versioned (`science-finding/v0.1`). The validator rejects unknown versions, and a breaking change requires a new version string.
+The format string is versioned (`science-finding/v0.1`). `answers` and `builds_on` are optional additions within v0.1. The validator rejects unknown versions, and a breaking change requires a new version string.

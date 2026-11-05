@@ -25,6 +25,7 @@ REQUIRED_KEYS = ("format", "title", "type", "created", "author", "confidence", "
 REQUIRED_HEADINGS = ("## Summary", "## Details", "## Suggested action")
 FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+REQUEST_ID_RE = re.compile(r"^SQ-\d{3,}$")
 MAX_BYTES = 200 * 1024
 MAX_TITLE = 120
 
@@ -117,7 +118,8 @@ def validate_finding(path: Union[str, Path]) -> Dict[str, object]:
 
     meta, body, parse_errors = parse_frontmatter(text)
     errors.extend(parse_errors)
-    result["meta"] = {k: v for k, v in meta.items() if k in ("title", "type", "created", "confidence", "affects")}
+    result["meta"] = {k: v for k, v in meta.items()
+                      if k in ("title", "type", "created", "confidence", "affects", "answers", "builds_on")}
 
     for key in REQUIRED_KEYS:
         if key not in meta:
@@ -144,6 +146,16 @@ def validate_finding(path: Union[str, Path]) -> Dict[str, object]:
         errors.append("contains_case_data must be false; findings must never include patient-level data")
     if "affects" in meta and not isinstance(meta["affects"], list):
         errors.append("affects must be a list, e.g. [LBL-01, LBL-06]")
+    if "answers" in meta:
+        answers = meta["answers"]
+        if not isinstance(answers, list) or not answers:
+            errors.append("answers must be a non-empty list of request IDs, e.g. [SQ-001]")
+        else:
+            bad = [a for a in answers if not REQUEST_ID_RE.match(str(a))]
+            if bad:
+                errors.append("answers has invalid request IDs %s (expected SQ-NNN)" % ", ".join(map(str, bad)))
+    if "builds_on" in meta and not isinstance(meta["builds_on"], list):
+        errors.append("builds_on must be a list of repo paths or archived findings")
 
     positions = []
     for heading in REQUIRED_HEADINGS:

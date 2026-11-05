@@ -19,6 +19,10 @@ Commands:
                                     .planning/config.json agent_skills for researcher/planner
                                     agents (merge only; existing entries are kept). `init` runs
                                     this automatically when .planning/config.json exists.
+  requests [--all]                  list the request queue (SQ-NNN items in
+                                    .planning/research/questions.md "## For Claude Science")
+  ask TEXT [--by WHO] [--context P] [--affects IDS]
+                                    append a new SQ-NNN request with the next free number
   session-hint                      for the SessionStart hook: print a one-line reminder when
                                     there is something to act on; otherwise print nothing.
                                     Always exits 0.
@@ -34,6 +38,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -49,9 +54,17 @@ from check_finding import validate_finding  # noqa: E402
 GSD_SKILL_TEMPLATE = TEMPLATES / "gsd" / "science-context" / "SKILL.md"
 GSD_SKILL_ENTRY = ".claude/skills/science-context"
 GSD_DEFAULT_AGENTS = ("gsd-phase-researcher", "gsd-project-researcher", "gsd-advisor-researcher",
-                      "gsd-planner", "gsd-plan-checker", "gsd-roadmapper")
+                      "gsd-assumptions-analyzer", "gsd-planner", "gsd-plan-checker", "gsd-roadmapper")
+QUESTIONS_REL = ".planning/research/questions.md"
+REQUESTS_HEADING = "## For Claude Science"
+REQUESTS_COMMENT = ("<!-- Request queue for Claude Science (science-bridge). One line per question:\n"
+                    "     - [ ] SQ-NNN (YYYY-MM-DD, who/where): question — context: paths; affects: IDs\n"
+                    "     Check for an existing item before adding. Claude Science answers with a finding that has\n"
+                    "     `answers: [SQ-NNN]`; `bridge.py archive` ticks the item. -->")
+REQUEST_LINE_RE = re.compile(r"^- \[( |x|X)\] (SQ-(\d{3,}))\b(.*)$")
 MANIFEST_FORMAT = "science-bridge-manifest/v0.1"
 PRIVACY_LEVELS = ("phi", "confidential", "public")
+ACCESS_MODES = ("repo-readonly", "science-only")
 ROUTES = ("note", "todo", "seed", "manual", "rejected")
 OUTBOX_RESERVED = {"MANIFEST.json", ".gitkeep"}
 INBOX_IGNORED = {".gitkeep", "README.md"}
@@ -110,6 +123,12 @@ def load_policy(root: Path, for_export: bool = False) -> Dict[str, Any]:
     privacy = policy.get("privacy")
     if privacy not in PRIVACY_LEVELS:
         raise BridgeError("policy.json: privacy must be one of %s" % ", ".join(PRIVACY_LEVELS))
+    policy.setdefault("access", "science-only")  # policies written before v0.3 had no access key
+    if policy["access"] not in ACCESS_MODES:
+        raise BridgeError("policy.json: access must be one of %s" % ", ".join(ACCESS_MODES))
+    policy.setdefault("do_not_read", [])
+    if not isinstance(policy["do_not_read"], list):
+        raise BridgeError("policy.json: do_not_read must be a list of glob patterns")
     policy.setdefault("allowed_sources", [])
     policy.setdefault("allowed_extensions", [])
     policy.setdefault("check_command", None)
@@ -251,8 +270,111 @@ def gsd_setup(root: Path, agents: List[str]) -> Dict[str, Any]:
             verified = GSD_SKILL_ENTRY + "/SKILL.md" in proc.stdout
         except (OSError, subprocess.TimeoutExpired):
             verified = None
+    section_added = ensure_requests_section(root)
     return {"skill": "%s/SKILL.md (%s)" % (GSD_SKILL_ENTRY, skill_status), "agents_added": added,
+            "requests_section": "%s (%s)" % (QUESTIONS_REL, "added" if section_added else "present"),
             "agents": agents, "gsd_sdk_verified": verified}
+
+
+def _questions_path(root: Path) -> Path:
+    return root / QUESTIONS_REL
+
+
+def ensure_requests_section(root: Path) -> bool:
+    """Create .planning/research/questions.md and/or its "For Claude Science" section. True if changed."""
+    if not (root / ".planning").is_dir():
+        return False
+    path = _questions_path(root)
+    text = path.read_text(encoding="utf-8") if path.is_file() else "# Open Research Questions\n"
+    if any(line.strip() == REQUESTS_HEADING for line in text.splitlines()):
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.rstrip("\n") + "\n\n" + REQUESTS_HEADING + "\n\n" + REQUESTS_COMMENT + "\n", encoding="utf-8")
+    return True
+
+
+def _section_bounds(lines: List[str]) -> Optional[range]:
+    try:
+        start = next(i for i, l in enumerate(lines) if l.strip() == REQUESTS_HEADING)
+    except StopIteration:
+        return None
+    end = next((j for j in range(start + 1, len(lines)) if lines[j].startswith("## ")), len(lines))
+    return range(start + 1, end)
+
+
+def list_requests(root: Path) -> List[Dict[str, Any]]:
+    path = _questions_path(root)
+    if not path.is_file():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    bounds = _section_bounds(lines)
+    out = []
+    for i in (bounds or []):
+        m = REQUEST_LINE_RE.match(lines[i].strip())
+        if m:
+            out.append({"id": m.group(2), "open": m.group(1) == " ", "text": m.group(4).strip()})
+    return out
+
+
+def tick_requests(root: Path, ids: List[str], answered_by: str) -> Dict[str, List[str]]:
+    path = _questions_path(root)
+    ticked, already, unknown = [], [], list(ids)
+    if not path.is_file():
+        return {"ticked": ticked, "already": already, "unknown": unknown}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for i in (_section_bounds(lines) or []):
+        m = REQUEST_LINE_RE.match(lines[i].strip())
+        if not m or m.group(2) not in ids:
+            continue
+        unknown = [u for u in unknown if u != m.group(2)]
+        if m.group(1) == " ":
+            lines[i] = "- [x] %s%s — answered: %s" % (m.group(2), m.group(4).rstrip(), answered_by)
+            ticked.append(m.group(2))
+        else:
+            already.append(m.group(2))
+    if ticked:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"ticked": ticked, "already": already, "unknown": unknown}
+
+
+def cmd_requests(args: argparse.Namespace) -> int:
+    root = require_project(args.project_dir)
+    items = list_requests(root)
+    shown = items if args.all else [r for r in items if r["open"]]
+    _emit({"file": QUESTIONS_REL, "open": sum(1 for r in items if r["open"]),
+           "answered": sum(1 for r in items if not r["open"]), "items": shown})
+    return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    root = require_project(args.project_dir)
+    if not (root / ".planning").is_dir():
+        raise BridgeError("no .planning/ directory; the request queue lives in %s" % QUESTIONS_REL)
+    text = " ".join(args.text.split())
+    if not text:
+        raise BridgeError("empty question")
+    ensure_requests_section(root)
+    items = list_requests(root)
+    dup = [r["id"] for r in items if r["text"].split("):", 1)[-1].split(" — ")[0].strip().lower() == text.lower()]
+    if dup:
+        raise BridgeError("the same question is already queued as %s" % ", ".join(dup))
+    nums = [int(r["id"][3:]) for r in items]
+    new_id = "SQ-%03d" % ((max(nums) if nums else 0) + 1)
+    line = "- [ ] %s (%s, %s): %s" % (new_id, _dt.date.today().isoformat(), args.by, text)
+    if args.context:
+        line += " — context: %s" % args.context
+    if args.affects:
+        line += "; affects: %s" % args.affects if args.context else " — affects: %s" % args.affects
+    path = _questions_path(root)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    bounds = _section_bounds(lines)
+    insert_at = bounds.stop if bounds else len(lines)
+    while insert_at > 0 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    lines.insert(insert_at, line)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _emit({"ok": True, "id": new_id, "line": line, "file": QUESTIONS_REL})
+    return 0
 
 
 def cmd_gsd_setup(args: argparse.Namespace) -> int:
@@ -274,6 +396,8 @@ def _export_errors(root: Path, src: Path, rel: str, policy: Dict[str, Any]) -> L
         return ["%s: resolves outside the project" % rel]
     if not real.is_file():
         return ["%s: not a regular file" % rel]
+    if any(fnmatch.fnmatchcase(rel, p) for p in policy.get("do_not_read", [])):
+        errors.append("%s: matches do_not_read in policy.json" % rel)
     if (root / "science") in real.parents:
         errors.append("%s: files already under science/ cannot be exported" % rel)
     exts = [e.lower() for e in policy["allowed_extensions"]]
@@ -434,6 +558,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                     for f in inb["findings"]],
         "attachments": inb["attachments"],
         "gsd": gsd_report(root),
+        "access": policy["access"],
+        "do_not_read": policy["do_not_read"],
+        "requests_open": [r for r in list_requests(root) if r["open"]],
     })
     return 0
 
@@ -466,6 +593,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
                 moved.append(att.name)
     shutil.move(str(src), str(archive / src.name))
     record = {"file": src.name, "route": args.route, "ref": args.ref, "routed_at": _now(), "moved": moved}
+    answers = result["meta"].get("answers") if result["ok"] else None
+    if answers and args.route != "rejected":
+        record["requests"] = tick_requests(root, [str(a) for a in answers], "science/archive/" + src.name)
     with (archive / "routing.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     _emit({"ok": True, **record})
@@ -493,6 +623,10 @@ def cmd_session_hint(args: argparse.Namespace) -> int:
             lines.append("[science-bridge] WARNING: science/outbox has %d problem(s) and Claude Science may read "
                          "unapproved files there. Run /science-bridge:bridge check before using Claude Science."
                          % len(out["violations"]))
+        open_requests = [r for r in list_requests(root) if r["open"]]
+        if open_requests:
+            lines.append("[science-bridge] %d open question(s) for Claude Science (%s). In Claude Science, ask it to "
+                         "process the open SQ requests." % (len(open_requests), QUESTIONS_REL))
         pending = inb["findings"]
         if pending:
             invalid = sum(1 for f in pending if not f["ok"])
@@ -529,10 +663,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("file")
     p.add_argument("--route", required=True, choices=ROUTES)
     p.add_argument("--ref", required=True, help="where it went, e.g. .planning/notes/2026-11-06-x.md")
+    p = sub.add_parser("requests")
+    p.add_argument("--all", action="store_true", help="include answered items")
+    p = sub.add_parser("ask")
+    p.add_argument("text")
+    p.add_argument("--by", default="user", help="who is asking, e.g. 'gsd-planner phase 3'")
+    p.add_argument("--context", default=None, help="paths the question concerns")
+    p.add_argument("--affects", default=None, help="requirement IDs, e.g. 'LBL-01, LBL-06'")
     sub.add_parser("session-hint")
     args = ap.parse_args(argv)
     handlers = {"init": cmd_init, "export": cmd_export, "check": cmd_check, "status": cmd_status,
-                "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup}
+                "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup,
+                "requests": cmd_requests, "ask": cmd_ask}
     try:
         return handlers[args.cmd](args)
     except BridgeError as e:

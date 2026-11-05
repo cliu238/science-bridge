@@ -291,6 +291,80 @@ class GsdIntegration(unittest.TestCase):
         self.assertEqual(out["gsd"]["agents_missing"], [])
 
 
+class RequestQueueAndAccess(unittest.TestCase):
+    def setUp(self):
+        self._which = bridge.shutil.which
+        bridge.shutil.which = lambda name: None
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / ".planning" / "research").mkdir(parents=True)
+        (self.root / ".planning" / "config.json").write_text("{}")
+        (self.root / ".planning" / "research" / "questions.md").write_text("# Open Research Questions\n\n## Other\n\n- x\n")
+        run(["--project-dir", str(self.root), "init"])
+        self.q = self.root / ".planning" / "research" / "questions.md"
+
+    def tearDown(self):
+        bridge.shutil.which = self._which
+
+    def test_template_defaults_to_repo_readonly(self):
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertEqual(out["access"], "repo-readonly")
+        policy = json.loads((self.root / "science" / "policy.json").read_text())
+        policy["access"] = "everything"
+        (self.root / "science" / "policy.json").write_text(json.dumps(policy))
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertEqual(code, 1)
+        self.assertIn("access must be one of", out["error"])
+
+    def test_gsd_setup_adds_section_once_and_keeps_other_content(self):
+        text = self.q.read_text()
+        self.assertEqual(text.count(bridge.REQUESTS_HEADING), 1)
+        self.assertIn("## Other", text)
+        run(["--project-dir", str(self.root), "gsd-setup"])
+        self.assertEqual(self.q.read_text().count(bridge.REQUESTS_HEADING), 1)
+
+    def test_ask_numbers_dedupes_and_archive_ticks(self):
+        code, out = run(["--project-dir", str(self.root), "ask", "Check oral cavity tables",
+                         "--by", "gsd-planner phase 3", "--context", "docs/oral.docx", "--affects", "LBL-01"])
+        self.assertEqual(out["id"], "SQ-001")
+        code, out = run(["--project-dir", str(self.root), "ask", "Literature review"])
+        self.assertEqual(out["id"], "SQ-002")
+        code, out = run(["--project-dir", str(self.root), "ask", "check oral cavity  tables"])
+        self.assertEqual(code, 1)
+        self.assertIn("SQ-001", out["error"])
+        code, out = run(["--project-dir", str(self.root), "requests"])
+        self.assertEqual([r["id"] for r in out["items"]], ["SQ-001", "SQ-002"])
+        text = self.q.read_text()
+        self.assertLess(text.index(bridge.REQUESTS_HEADING), text.index("SQ-001"), "items go inside their section")
+        self.assertIn("## Other\n\n- x\n", text, "other sections are untouched")
+
+        finding = VALID.replace("affects: [LBL-01, LBL-06]", "affects: [LBL-01]\nanswers: [SQ-001, SQ-099]")
+        (self.root / "science" / "inbox" / "2026-11-06-oral.md").write_text(finding)
+        code, out = run(["--project-dir", str(self.root), "archive", "2026-11-06-oral.md", "--route", "note", "--ref", "n"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["requests"], {"ticked": ["SQ-001"], "already": [], "unknown": ["SQ-099"]})
+        self.assertIn("- [x] SQ-001", self.q.read_text())
+        self.assertIn("answered: science/archive/2026-11-06-oral.md", self.q.read_text())
+        code, out = run(["--project-dir", str(self.root), "requests"])
+        self.assertEqual([r["id"] for r in out["items"]], ["SQ-002"])
+
+    def test_validator_checks_answers_and_builds_on(self):
+        p = self.root / "2026-11-06-x.md"
+        p.write_text(VALID.replace("affects: [LBL-01, LBL-06]", "answers: [Q1]\nbuilds_on: notes.md"))
+        r = validate_finding(p)
+        self.assertTrue(any("invalid request IDs" in e for e in r["errors"]))
+        self.assertIn("builds_on must be a list of repo paths or archived findings", r["errors"])
+
+    def test_export_refuses_do_not_read(self):
+        (self.root / "prereg").mkdir()
+        (self.root / "prereg" / "sealed.md").write_text("fold ids")
+        policy = json.loads((self.root / "science" / "policy.json").read_text())
+        policy.update(privacy="public", do_not_read=["prereg/sealed*"])
+        (self.root / "science" / "policy.json").write_text(json.dumps(policy))
+        code, out = run(["--project-dir", str(self.root), "export", str(self.root / "prereg" / "sealed.md")])
+        self.assertEqual(code, 1)
+        self.assertTrue(any("do_not_read" in e for e in out["errors"]))
+
+
 class SessionHint(unittest.TestCase):
     def hint(self, cwd):
         proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "bridge.py"), "session-hint"],
