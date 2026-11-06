@@ -1,10 +1,14 @@
 {
-  "policy_version": 2,
+  "policy_version": 3,
   "access": "repo-readonly",
   "do_not_read": [],
-  "privacy": "phi",
-  "allowed_sources": [],
-  "allowed_extensions": [".md", ".csv", ".tsv", ".json", ".png", ".svg", ".pdf", ".docx", ".parquet", ".txt"],
-  "check_command": null,
-  "max_file_mb": 50
+  "privacy": "confidential",
+  "skill_min_version": "0.4.0",
+  "compute": {},
+  "export": {
+    "allowed_sources": [],
+    "allowed_extensions": [".md", ".csv", ".tsv", ".json", ".png", ".svg", ".pdf", ".docx", ".parquet", ".txt"],
+    "check_command": null,
+    "max_file_mb": 50
+  }
 }

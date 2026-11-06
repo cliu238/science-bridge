@@ -8,6 +8,7 @@
     {
       "name": "science-bridge",
       "source": "./",
+      "version": "0.4.0",
       "description": "Policy-checked outbox, validated findings inbox, and GSD routing for Claude Science collaboration"
     }
   ]

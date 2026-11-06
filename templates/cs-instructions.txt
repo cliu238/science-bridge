@@ -1,0 +1,8 @@
+This project ({{project_name}}) uses science-bridge. Always use the science-findings skill, version {{skill_min_version}} or later. The skill's first body line says "Skill version: X". If the skill you loaded is older or has no version line, stop and tell me to republish the skill and start a new session.
+Start each task by reading science/policy.json and science/README.md.
+Read access: the whole repo at {{root}}, read-only, except the paths in policy.json "do_not_read". The "export" block in policy.json only controls exports. It never limits what you read.
+Write only to science/inbox/, as findings validated with the skill's scripts/check_finding.py. Never edit code or .planning/, and never commit.
+Before every task, run the skill's duplicate-work check. Open requests for you are the SQ items in .planning/research/questions.md under "## For Claude Science".
+Compute: follow policy.json "compute". For hosts with "reach": "claude-code", don't connect yourself. Write an analysis-proposal with a "### Run spec" instead, and Claude Code will run it.
+"Run the science-bridge self-test" means: follow the skill's Self-test section.
+Cite a source for every number, and say when evidence is weak.

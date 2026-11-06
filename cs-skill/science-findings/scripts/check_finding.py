@@ -10,6 +10,10 @@ Usage:
 
 Prints one JSON object per file ({"file", "ok", "errors", "meta"}) as a JSON list.
 Exit code: 0 if every file is valid, 1 otherwise, 2 on usage error.
+
+Optional keys checked here (all within science-finding/v0.1): affects, answers, builds_on,
+partial (true/false; true needs answers) and compute (a policy.json compute host name; only
+for type analysis-proposal, and the body must have a "### Run spec" section).
 """
 
 import json
@@ -26,6 +30,9 @@ REQUIRED_HEADINGS = ("## Summary", "## Details", "## Suggested action")
 FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 REQUEST_ID_RE = re.compile(r"^SQ-\d{3,}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+RUN_SPEC_RE = re.compile(r"^### Run spec\s*$", re.MULTILINE)
+META_KEYS = ("title", "type", "created", "confidence", "affects", "answers", "builds_on", "partial", "compute")
 MAX_BYTES = 200 * 1024
 MAX_TITLE = 120
 
@@ -118,8 +125,7 @@ def validate_finding(path: Union[str, Path]) -> Dict[str, object]:
 
     meta, body, parse_errors = parse_frontmatter(text)
     errors.extend(parse_errors)
-    result["meta"] = {k: v for k, v in meta.items()
-                      if k in ("title", "type", "created", "confidence", "affects", "answers", "builds_on")}
+    result["meta"] = {k: v for k, v in meta.items() if k in META_KEYS}
 
     for key in REQUIRED_KEYS:
         if key not in meta:
@@ -156,6 +162,19 @@ def validate_finding(path: Union[str, Path]) -> Dict[str, object]:
                 errors.append("answers has invalid request IDs %s (expected SQ-NNN)" % ", ".join(map(str, bad)))
     if "builds_on" in meta and not isinstance(meta["builds_on"], list):
         errors.append("builds_on must be a list of repo paths or archived findings")
+    if "partial" in meta:
+        if not isinstance(meta["partial"], bool):
+            errors.append("partial must be true or false")
+        elif meta["partial"] and "answers" not in meta:
+            errors.append("partial: true needs answers: [SQ-NNN] (the requests this finding makes progress on)")
+    if "compute" in meta:
+        host = meta["compute"]
+        if not isinstance(host, str) or not HOST_RE.match(host):
+            errors.append("compute must be a host name from policy.json compute (letters, digits, '.', '_', '-')")
+        if meta.get("type") != "analysis-proposal":
+            errors.append("compute is only allowed when type is analysis-proposal")
+        if not RUN_SPEC_RE.search(body):
+            errors.append("compute needs a '### Run spec' section in the body saying what to run on that host")
 
     positions = []
     for heading in REQUIRED_HEADINGS:

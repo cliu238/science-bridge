@@ -7,15 +7,45 @@ This document defines the shared handoff format between a Claude Code (+ GSD) pr
 ```
 <repo>/
 ├── science/
-│   ├── README.md        project brief for Claude Science (written by the project owner)
-│   ├── policy.json      access mode, privacy level, export rules, do_not_read list
+│   ├── README.md        map of the project for Claude Science (managed block + project brief)
+│   ├── policy.json      access mode, do_not_read, compute hosts, skill_min_version, export rules
 │   ├── outbox/          optional: files from OUTSIDE the repo, written only by `bridge.py export`
 │   │   └── MANIFEST.json  every exported file: name, sha256, bytes, source, exported_at
-│   ├── inbox/           Claude Science → project. One markdown finding per file.
-│   └── archive/         findings already routed into GSD, plus routing.jsonl
+│   ├── inbox/           Claude Science → project. One markdown finding per file,
+│   │                    plus selftest.json while a self-test waits for `bridge.py verify`
+│   ├── archive/         findings already routed into GSD, routing.jsonl, selftest-latest.json
+│   └── runs/            outputs of jobs Claude Code ran for Claude Science (one folder per finding slug)
 └── .planning/research/questions.md
                          contains "## For Claude Science": the request queue (SQ-NNN items)
 ```
+
+## policy.json (v3)
+
+```json
+{
+  "policy_version": 3,
+  "access": "repo-readonly",
+  "do_not_read": ["prereg/sealed_fold_record.yaml"],
+  "privacy": "confidential",
+  "skill_min_version": "0.4.0",
+  "compute": {
+    "skipjack": {"reach": "claude-code", "notes": "SLURM login node; interactive MFA login"}
+  },
+  "export": {
+    "allowed_sources": [], "allowed_extensions": [".md", ".csv"], "check_command": null, "max_file_mb": 50
+  }
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `access`, `do_not_read` | what Claude Science may read (see below). These are the **only** keys that limit reading. |
+| `privacy` | `phi`, `confidential` or `public`. It governs exports, and `phi` requires `export.allowed_sources`. Findings never contain case-level data, whatever the level. |
+| `skill_min_version` | the lowest `science-findings` skill version this project works with. An older skill must stop and ask for an update. |
+| `compute` | hosts for heavy work. `reach: claude-science` means Claude Science uses its own Compute target of that name. `reach: claude-code` means Claude Science writes an `analysis-proposal` with a `### Run spec` and Claude Code runs it. |
+| `export` | rules for `bridge.py export` into `outbox/`. **This block never limits what Claude Science reads.** |
+
+Policies older than v3 have the export keys at the top level. `bridge.py init` upgrades them in place and keeps every value.
 
 ## Access modes (`policy.json` → `access`)
 
@@ -46,6 +76,7 @@ Rules:
 - IDs are `SQ-` followed by at least three digits. Each new item takes the next free number.
 - Before adding an item, check that the same question isn't already listed.
 - Claude Science answers an item with a finding whose frontmatter has `answers: [SQ-001]`. When that finding is archived, `bridge.py archive` ticks the item and appends ` — answered: <archive path>`.
+- A finding that covers only part of an item also sets `partial: true`. Archiving then leaves the item open and appends ` — progress: <archive path>`. The finding that completes the item omits `partial`.
 
 ## Finding files (inbox)
 
@@ -92,6 +123,8 @@ provenance: "Claude Science project 'stagebench', artifact 'larynx_groups.csv' v
 | `answers` | no | list of request IDs (`SQ-NNN`) this finding answers |
 | `builds_on` | no | list of existing work it builds on: repo paths, archived findings. Expected whenever the duplicate-work check found related work |
 | `provenance` | no | a Claude Science artifact/version reference, so numbers can be traced |
+| `partial` | no | `true` when the finding answers only part of the items in `answers` (requires `answers`) |
+| `compute` | no | for `analysis-proposal` only: the `policy.json` compute host to run on. The body must then contain a `### Run spec` subsection under `## Suggested action` |
 
 What each `type` means:
 
@@ -130,10 +163,39 @@ Before starting work, Claude Science checks whether the work was already done. I
    - `notes/`, `todos/`.
 3. The code: is the analysis already implemented, tested, or decided against?
 4. `git log` (recent commits): what changed recently.
+5. `science/runs/`: results of earlier jobs that Claude Code ran for Claude Science.
 
 Depending on what it finds:
 - **Already fully covered:** don't redo it. Write a short `finding` that points to where the work is (in `builds_on`) and what, if anything, is still missing.
 - **Partly covered:** build on it, and list it in `builds_on`. The Summary must separate what was known from what is new.
+
+## Run spec (for `compute:` proposals)
+
+```markdown
+## Suggested action
+Run the bootstrap on skipjack and report the CI table.
+
+### Run spec
+- run: `sbatch scripts/bootstrap_ci.sbatch` (module load python/3.11)
+- inputs: results/run-2026-11-06/metrics.parquet
+- outputs: science/runs/2026-11-06-bootstrap-ci/ (ci.csv, log.txt)
+- resources: partition=cpu, 1 node, 8 cores, 16G, 30 min
+- check: ci.csv has one row per model, lower ≤ estimate ≤ upper
+```
+
+Claude Code turns this into a GSD todo. When it is executed, the outputs are committed under `science/runs/<slug>/`. Claude Science reads them there and writes a follow-up finding with `builds_on: [science/runs/<slug>/]`.
+
+## Self-test file (`inbox/selftest.json`)
+
+`scripts/selftest.py` writes it, and `bridge.py verify` checks it against the real repo, then moves it to `archive/selftest-latest.json`. The format is `science-bridge-selftest/v1`, with these fields:
+- `skill_version` and `policy`;
+- `repo`: `git_head`, `tracked_files` and a probe file's sha256;
+- `write_probe_repo_root` (must be `denied`);
+- `inbox_write` (must be `ok`);
+- `requests_open`;
+- `compute` results.
+
+It is not a finding.
 
 ## Privacy
 

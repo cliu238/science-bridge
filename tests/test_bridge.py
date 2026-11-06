@@ -3,19 +3,25 @@
 Run from the repo root:  python3 -m unittest discover -s tests -v
 """
 
+import datetime as _dt
 import io
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SKILL_SCRIPTS = ROOT / "cs-skill" / "science-findings" / "scripts"
+SELFTEST = SKILL_SCRIPTS / "selftest.py"
 sys.path.insert(0, str(ROOT / "scripts"))
-sys.path.insert(0, str(ROOT / "skills" / "science-findings" / "scripts"))
+sys.path.insert(0, str(SKILL_SCRIPTS))
 
 import bridge  # noqa: E402
 from check_finding import validate_finding  # noqa: E402
@@ -55,6 +61,42 @@ def run(argv):
         return code, json.loads(out) if out.strip() else None
     except ValueError:
         return code, out
+
+
+V2_POLICY = {
+    "policy_version": 2,
+    "access": "repo-readonly",
+    "do_not_read": ["prereg/*"],
+    "privacy": "phi",
+    "allowed_sources": ["docs/*.md"],
+    "allowed_extensions": [".md", ".csv"],
+    "check_command": None,
+    "max_file_mb": 5,
+    "team_note": "kept by migration",
+}
+
+HAS_GIT = shutil.which("git") is not None
+IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def git(root, *args):
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.org",
+                    "-c", "commit.gpgsign=false"] + list(args), check=True, capture_output=True, timeout=60)
+
+
+def write_json(path, obj):
+    Path(path).write_text(json.dumps(obj, indent=2))
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def confirm_skill(root, version=None):
+    """Pretend Claude Science already passed a self-test with the bundled skill."""
+    write_json(Path(root) / "science" / "archive" / "selftest-latest.json",
+               {"format": bridge.SELFTEST_FORMAT, "created": bridge._now(),
+                "skill_version": version or bridge.SKILL_VERSION})
 
 
 class FindingValidation(unittest.TestCase):
@@ -120,19 +162,30 @@ class BridgeFlow(unittest.TestCase):
 
     def set_policy(self, **overrides):
         policy = json.loads((self.sci / "policy.json").read_text())
-        policy.update(overrides)
+        for key, value in overrides.items():
+            if key in bridge.EXPORT_KEYS:
+                policy["export"][key] = value
+            else:
+                policy[key] = value
         (self.sci / "policy.json").write_text(json.dumps(policy))
 
     def test_init_is_idempotent_and_never_overwrites(self):
-        (self.sci / "README.md").write_text("custom brief")
+        readme = self.sci / "README.md"
+        readme.write_text(readme.read_text().replace("## Project brief\n", "## Project brief\n\ncustom brief\n"))
+        before, policy_before = readme.read_text(), (self.sci / "policy.json").read_text()
         code, out = run(["--project-dir", str(self.root), "init"])
         self.assertEqual(code, 0)
         self.assertEqual(out["created"], [])
-        self.assertEqual((self.sci / "README.md").read_text(), "custom brief")
-        for sub in ("outbox", "inbox", "archive"):
+        self.assertEqual((out["policy"], out["readme"]), ("unchanged", "unchanged"))
+        self.assertEqual(readme.read_text(), before)
+        self.assertIn("custom brief", before)
+        self.assertEqual((self.sci / "policy.json").read_text(), policy_before)
+        for sub in ("outbox", "inbox", "archive", "runs"):
             self.assertTrue((self.sci / sub).is_dir())
+        self.assertTrue((self.sci / "runs" / ".gitkeep").is_file())
 
     def test_phi_requires_whitelist(self):
+        self.set_policy(privacy="phi")
         code, out = run(["--project-dir", str(self.root), "export", str(self.root / "docs" / "guide.md")])
         self.assertEqual(code, 1)
         self.assertIn("allowed_sources", out["error"])
@@ -366,12 +419,28 @@ class RequestQueueAndAccess(unittest.TestCase):
 
 
 class SessionHint(unittest.TestCase):
-    def hint(self, cwd):
+    def hint(self, cwd, plugins_dir=None):
+        env = {**os.environ, "CLAUDE_PROJECT_DIR": "",
+               "SCIENCE_BRIDGE_PLUGINS_DIR": str(plugins_dir or tempfile.mkdtemp())}
         proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "bridge.py"), "session-hint"],
                               input=json.dumps({"cwd": str(cwd), "hook_event_name": "SessionStart"}),
-                              capture_output=True, text=True, timeout=30, env={**os.environ, "CLAUDE_PROJECT_DIR": ""})
+                              capture_output=True, text=True, timeout=30, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
         return proc.stdout
+
+    def fake_marketplace(self, version, name="test-mkt"):
+        """A plugins dir whose known marketplace offers science-bridge VERSION."""
+        plugins, mkt = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        (mkt / ".claude-plugin").mkdir()
+        write_json(mkt / ".claude-plugin" / "marketplace.json",
+                   {"name": name, "plugins": [{"name": "other", "source": "./other"},
+                                              {"name": "science-bridge", "source": "./"}]})
+        write_json(mkt / ".claude-plugin" / "plugin.json", {"name": "science-bridge", "version": version})
+        write_json(plugins / "known_marketplaces.json",
+                   {"broken": {"installLocation": "/nonexistent/x"}, "weird": 42,
+                    name: {"source": {"source": "directory", "path": str(mkt)}, "installLocation": str(mkt)}})
+        return plugins
 
     def test_silent_without_science_folder(self):
         self.assertEqual(self.hint(tempfile.mkdtemp()), "")
@@ -379,6 +448,7 @@ class SessionHint(unittest.TestCase):
     def test_reports_pending_and_outbox_problems_from_subdir(self):
         root = Path(tempfile.mkdtemp())
         run(["--project-dir", str(root), "init"])
+        confirm_skill(root)
         self.assertEqual(self.hint(root), "")
         (root / "science" / "inbox" / "2026-11-06-larynx.md").write_text(VALID)
         (root / "science" / "outbox" / "stray.csv").write_text("x")
@@ -393,6 +463,654 @@ class SessionHint(unittest.TestCase):
         (root / ".planning" / "config.json").write_text("{}")
         run(["--project-dir", str(root), "init", "--no-gsd"])
         self.assertIn("science-context skill is missing", self.hint(root))
+
+    def test_plugin_update_hint_uses_known_marketplaces(self):
+        root = Path(tempfile.mkdtemp())
+        run(["--project-dir", str(root), "init"])
+        confirm_skill(root)
+        out = self.hint(root, self.fake_marketplace("9.9.9"))
+        self.assertIn("[science-bridge] v9.9.9 is available (this session runs v%s)" % bridge.PLUGIN_VERSION, out)
+        self.assertIn("claude plugin marketplace update test-mkt && claude plugin update science-bridge@test-mkt", out)
+        self.assertIn("restart Claude Code", out)
+        self.assertEqual(self.hint(root, self.fake_marketplace(bridge.PLUGIN_VERSION)), "")
+        self.assertEqual(self.hint(root, self.fake_marketplace("0.0.1")), "")
+
+    def test_legacy_policy_selftest_and_unconfirmed_skill_hints(self):
+        root = Path(tempfile.mkdtemp())
+        run(["--project-dir", str(root), "init"])
+        out = self.hint(root)
+        self.assertIn("hasn't confirmed skill v%s yet" % bridge.SKILL_VERSION, out)
+        confirm_skill(root, "0.3.0")
+        self.assertIn("hasn't confirmed skill v%s yet" % bridge.SKILL_VERSION, self.hint(root))
+        confirm_skill(root)
+        self.assertEqual(self.hint(root), "")
+        write_json(root / "science" / "inbox" / "selftest.json", {"format": bridge.SELFTEST_FORMAT})
+        out = self.hint(root)
+        self.assertIn("run /science-bridge:bridge verify", out)
+        self.assertNotIn("finding(s) waiting", out, "selftest.json is not a finding")
+        write_json(root / "science" / "policy.json", V2_POLICY)
+        self.assertIn("run /science-bridge:bridge init to upgrade science/ (policy v3)", self.hint(root))
+
+    def test_at_most_six_lines_and_broken_policy_is_silent(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".planning" / "research").mkdir(parents=True)
+        (root / ".planning" / "config.json").write_text("{}")
+        (root / ".planning" / "research" / "questions.md").write_text(
+            "# Q\n\n## For Claude Science\n\n- [ ] SQ-001 (2026-11-06, user): open\n")
+        run(["--project-dir", str(root), "init", "--no-gsd"])
+        write_json(root / "science" / "policy.json", V2_POLICY)
+        (root / "science" / "outbox" / "stray.csv").write_text("x")
+        (root / "science" / "inbox" / "2026-11-06-larynx.md").write_text(VALID)
+        write_json(root / "science" / "inbox" / "selftest.json", {})
+        lines = self.hint(root, self.fake_marketplace("9.9.9")).strip().splitlines()
+        self.assertEqual(len(lines), 6)
+        self.assertIn("WARNING", lines[0])
+        (root / "science" / "policy.json").write_text("{not json")
+        out = self.hint(root)
+        self.assertNotIn("Traceback", out)
+
+
+class Versions(unittest.TestCase):
+    def test_versions_are_consistent(self):
+        plugin = read_json(ROOT / ".claude-plugin" / "plugin.json")
+        market = read_json(ROOT / ".claude-plugin" / "marketplace.json")
+        entry = next(p for p in market["plugins"] if p["name"] == "science-bridge")
+        self.assertEqual(plugin["version"], bridge.PLUGIN_VERSION)
+        self.assertEqual(entry["version"], bridge.PLUGIN_VERSION)
+        self.assertRegex(bridge.SKILL_VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertNotEqual(bridge.SKILL_VERSION, "0.0.0", "SKILL.md needs a 'Skill version: X.Y.Z' line")
+        template = read_json(ROOT / "templates" / "policy.json")
+        self.assertEqual(template["policy_version"], bridge.POLICY_VERSION)
+        self.assertLessEqual(bridge.vtuple(template["skill_min_version"]), bridge.vtuple(bridge.SKILL_VERSION))
+
+    def test_vtuple(self):
+        self.assertGreater(bridge.vtuple("0.10.0"), bridge.vtuple("0.9.9"))
+        self.assertEqual(bridge.vtuple("0.4"), (0, 4, 0))
+        self.assertEqual(bridge.vtuple(None), (0, 0, 0))
+        self.assertEqual(bridge.vtuple("v1.2.3-beta"), (1, 2, 3))
+
+
+class PolicyMigration(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "guide.md").write_text("guide\n")
+        (self.root / "data").mkdir()
+        (self.root / "data" / "cases.csv").write_text("id\n1\n")
+        run(["--project-dir", str(self.root), "init"])
+        self.policy_path = self.root / "science" / "policy.json"
+
+    def test_v2_works_in_memory_then_init_migrates_on_disk_keeping_values(self):
+        write_json(self.policy_path, V2_POLICY)
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out["legacy_policy"])
+        self.assertEqual(out["policy_version"], 2)
+        code, out = run(["--project-dir", str(self.root), "export", "docs/guide.md", "data/cases.csv"])
+        self.assertEqual(code, 1, "legacy top-level allowed_sources must still be enforced")
+        self.assertTrue(any("cases.csv" in e and "allowed_sources" in e for e in out["errors"]))
+        code, out = run(["--project-dir", str(self.root), "export", "docs/guide.md"])
+        self.assertEqual(code, 0, out)
+
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["policy"], "migrated v2→v3")
+        disk = read_json(self.policy_path)
+        self.assertEqual(disk["policy_version"], 3)
+        self.assertEqual(disk["export"], {k: V2_POLICY[k] for k in bridge.EXPORT_KEYS})
+        for key in bridge.EXPORT_KEYS:
+            self.assertNotIn(key, disk)
+        for key in ("access", "do_not_read", "privacy", "team_note"):
+            self.assertEqual(disk[key], V2_POLICY[key])
+        self.assertEqual(disk["compute"], {})
+        self.assertEqual(disk["skill_min_version"], bridge.SKILL_VERSION)
+        self.assertEqual(list(disk)[:7], ["policy_version", "access", "do_not_read", "privacy", "skill_min_version",
+                                          "compute", "export"])
+
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["policy"], "unchanged")
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertFalse(out["legacy_policy"])
+        code, out = run(["--project-dir", str(self.root), "export", "data/cases.csv"])
+        self.assertEqual(code, 1, "migrated whitelist still enforced")
+
+    def test_v1_without_access_defaults_to_science_only(self):
+        write_json(self.policy_path, {"privacy": "confidential", "allowed_sources": [], "max_file_mb": 10})
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertEqual((out["access"], out["legacy_policy"]), ("science-only", True))
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["policy"], "migrated v1→v3")
+        disk = read_json(self.policy_path)
+        self.assertEqual(disk["access"], "science-only")
+        self.assertEqual(disk["do_not_read"], [])
+        self.assertEqual(disk["export"], {"allowed_sources": [], "allowed_extensions": [], "check_command": None,
+                                          "max_file_mb": 10})
+
+    def test_skill_min_version_is_raised_never_lowered(self):
+        policy = read_json(self.policy_path)
+        policy["skill_min_version"] = "0.1.0"
+        write_json(self.policy_path, policy)
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["policy"], "updated")
+        self.assertEqual(out["skill_min_version"], "%s (raised from 0.1.0)" % bridge.SKILL_VERSION)
+        self.assertEqual(read_json(self.policy_path)["skill_min_version"], bridge.SKILL_VERSION)
+        policy["skill_min_version"] = "99.0.0"
+        write_json(self.policy_path, policy)
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["policy"], "unchanged")
+        self.assertEqual(read_json(self.policy_path)["skill_min_version"], "99.0.0")
+
+    def test_v3_validation(self):
+        good = read_json(self.policy_path)
+        for bad, msg in (({"allowed_sources": ["x"]}, 'inside the "export" block'),
+                         ({"compute": {"hpc": {"reach": "ftp"}}}, "compute.hpc.reach"),
+                         ({"compute": {"bad host": {"reach": "claude-code"}}}, "compute host"),
+                         ({"compute": {"-oProxyCommand": {"reach": "claude-code"}}}, "compute host"),
+                         ({"skill_min_version": "latest"}, "skill_min_version"),
+                         ({"policy_version": 4}, "newer"),
+                         ({"export": []}, "export must be an object")):
+            write_json(self.policy_path, {**good, **bad})
+            code, out = run(["--project-dir", str(self.root), "status"])
+            self.assertEqual(code, 1, bad)
+            self.assertIn(msg, out["error"])
+        write_json(self.policy_path, {**good, "privacy": "nope"})
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(code, 1)
+        self.assertIn("invalid, left unchanged", out["policy"])
+        self.assertEqual(read_json(self.policy_path)["privacy"], "nope")
+
+
+class ReadmeSetup(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.readme = self.root / "science" / "README.md"
+        self.template = (ROOT / "templates" / "README.md").read_text()
+
+    def test_fresh_render_fills_brief_from_planning(self):
+        (self.root / ".planning").mkdir()
+        (self.root / ".planning" / "PROJECT.md").write_text(
+            "# My Project\n\n## What This Is\n\n<!-- inferred\n     from notes -->\nA platform that stages\ncancer.\n\n"
+            "Second paragraph.\n\n## Core Value\n\nCorrect numbers.\n\n## Requirements\n")
+        (self.root / ".planning" / "REQUIREMENTS.md").write_text(
+            "- **LBL-01** a\n- **LBL-02** b\n- **MET-01** c\nSee LBL-01 again; UTF-8 is not an ID.\n")
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "created")
+        text = self.readme.read_text()
+        self.assertTrue(text.startswith("# Science handoff: My Project\n"))
+        self.assertIn("**What the project is:** A platform that stages cancer.\n", text)
+        self.assertNotIn("Second paragraph", text)
+        self.assertIn("**Core value:** Correct numbers.\n", text)
+        self.assertIn("**Requirement ID prefixes for `affects`:** LBL (2), MET (1)\n", text)
+        self.assertIn("**Notes for Claude Science:**", text)
+        self.assertNotIn("{{", text)
+        self.assertEqual(bridge._split_managed(text)[1], bridge._split_managed(self.template)[1])
+
+    def test_fresh_render_without_project_md_uses_placeholder_and_folder_name(self):
+        run(["--project-dir", str(self.root), "init"])
+        text = self.readme.read_text()
+        self.assertTrue(text.startswith("# Science handoff: %s\n" % self.root.resolve().name))
+        self.assertIn(bridge.BRIEF_PLACEHOLDER, text)
+        self.assertNotIn("**What the project is:**", text)
+        self.assertNotIn("Requirement ID prefixes", text)
+
+    def test_managed_block_refresh_keeps_user_text(self):
+        run(["--project-dir", str(self.root), "init"])
+        before, block, after = bridge._split_managed(self.readme.read_text())
+        edited = (before.replace("# Science handoff:", "# Science handoff (renamed):") + bridge.MANAGED_START
+                  + "\nOLD MANAGED TEXT\n" + bridge.MANAGED_END + "\n\nMy note between.\n" + after + "\nMy brief.\n")
+        self.readme.write_text(edited)
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "managed-block-updated")
+        text = self.readme.read_text()
+        self.assertNotIn("OLD MANAGED TEXT", text)
+        for kept in ("# Science handoff (renamed):", "My note between.", "My brief."):
+            self.assertIn(kept, text)
+        self.assertEqual(bridge._split_managed(text)[1], block)
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "unchanged")
+
+    def test_legacy_readme_migration_keeps_project_brief(self):
+        (self.root / "science").mkdir()
+        legacy = ("# Science handoff: Legacy Name\n\nOld intro.\n\n## Rules for Claude Science\n\n1. old rule\n\n"
+                  "## Project brief\n\n**What the project is:** legacy brief text.\n\n- LBL-01 (labels)\n")
+        self.readme.write_text(legacy)
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "migrated-legacy")
+        self.assertEqual(out["readme_backup"], "science/README.md.bak")
+        self.assertEqual((self.root / "science" / "README.md.bak").read_text(), legacy)
+        text = self.readme.read_text()
+        self.assertTrue(text.startswith("# Science handoff: Legacy Name\n"))
+        self.assertIn(bridge.MANAGED_START, text)
+        self.assertTrue(text.endswith("## Project brief\n\n**What the project is:** legacy brief text.\n\n"
+                                      "- LBL-01 (labels)\n"))
+        self.assertNotIn("old rule", text)
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "unchanged")
+
+    def test_legacy_readme_without_brief_heading_keeps_whole_body(self):
+        (self.root / "science").mkdir()
+        self.readme.write_text("# My notes\n\ncustom brief\nsecond line\n")
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "migrated-legacy")
+        text = self.readme.read_text()
+        self.assertTrue(text.endswith("## Project brief\n\ncustom brief\nsecond line\n"))
+        self.assertNotIn("# My notes", text)
+
+
+class ClaudeScienceSetup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_skill_zip_contents(self):
+        src = self.tmp / "src" / "science-findings"
+        shutil.copytree(str(bridge.CS_SKILL_DIR), str(src), ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (src / "scripts" / "__pycache__").mkdir()
+        (src / "scripts" / "__pycache__" / "check_finding.cpython-39.pyc").write_bytes(b"x")
+        (src / "scripts" / "stray.pyc").write_bytes(b"x")
+        (src / ".DS_Store").write_bytes(b"x")
+        saved = bridge.CS_SKILL_DIR
+        bridge.CS_SKILL_DIR = src
+        try:
+            code, out = run(["skill-zip", "--out", str(self.tmp / "out" / "skill.zip")])
+        finally:
+            bridge.CS_SKILL_DIR = saved
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["skill_version"], bridge.SKILL_VERSION)
+        with zipfile.ZipFile(out["zip"]) as z:
+            names = z.namelist()
+            self.assertIn("Skill version: %s" % bridge.SKILL_VERSION, z.read("science-findings/SKILL.md").decode())
+        self.assertTrue(all(n.startswith("science-findings/") for n in names), names)
+        for needed in ("science-findings/SKILL.md", "science-findings/references/format.md",
+                       "science-findings/scripts/check_finding.py", "science-findings/scripts/selftest.py"):
+            self.assertIn(needed, names)
+            self.assertIn(needed, out["files"])
+        for n in names:
+            self.assertNotIn("__pycache__", n)
+            self.assertFalse(n.endswith((".pyc", ".DS_Store")), n)
+
+    def test_skill_zip_default_location(self):
+        saved = tempfile.tempdir
+        tempfile.tempdir = str(self.tmp)
+        try:
+            code, out = run(["skill-zip"])
+        finally:
+            tempfile.tempdir = saved
+        self.assertEqual(Path(out["zip"]), self.tmp / "science-bridge" / ("science-findings-%s.zip" % bridge.SKILL_VERSION))
+        self.assertTrue(Path(out["zip"]).is_file())
+
+    def test_cs_setup_grants_instructions_and_steps(self):
+        root = (self.tmp / "proj").resolve()
+        (root / ".planning").mkdir(parents=True)
+        (root / ".planning" / "PROJECT.md").write_text("# Staging Bench\n")
+        run(["--project-dir", str(root), "init"])
+        code, out = run(["--project-dir", str(root), "cs-setup", "--out", str(self.tmp / "s.zip")])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["project_name"], "Staging Bench")
+        self.assertEqual(out["suggested_cs_project_name"], "Staging Bench (science)")
+        self.assertEqual(out["grants"], [{"path": str(root), "mode": "Read-only"},
+                                         {"path": str(root / "science"), "mode": "Read & write"}])
+        self.assertIn(str(root), out["instructions"])
+        self.assertIn("version %s or later" % bridge.SKILL_VERSION, out["instructions"])
+        self.assertIn("Staging Bench", out["instructions"])
+        self.assertNotIn("{{", out["instructions"])
+        self.assertTrue(Path(out["skill_zip"]).is_file())
+        self.assertEqual(out["skill_version"], bridge.SKILL_VERSION)
+        steps = "\n".join(out["steps"])
+        for phrase in ("Edit & republish", "Add skill › Upload a skill", "Add folder…", "Instructions for Claude",
+                       "NEW session", "Run the science-bridge self-test", "/science-bridge:bridge verify"):
+            self.assertIn(phrase, steps)
+        self.assertEqual(steps.count("Add folder…"), 2)
+        self.assertEqual(out["warnings"], [])
+
+        policy = read_json(root / "science" / "policy.json")
+        policy["access"] = "science-only"
+        write_json(root / "science" / "policy.json", policy)
+        code, out = run(["--project-dir", str(root), "cs-setup", "--out", str(self.tmp / "s.zip")])
+        self.assertEqual(out["grants"], [{"path": str(root / "science"), "mode": "Read & write"}])
+        self.assertIn("science-only", out["instructions"])
+        self.assertNotIn("{{", out["instructions"])
+
+
+@unittest.skipUnless(HAS_GIT, "git is required")
+class SelfTestAndVerify(unittest.TestCase):
+    def setUp(self):
+        self._ssh = bridge.ssh_check
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        (self.root / ".planning" / "research").mkdir(parents=True)
+        (self.root / ".planning" / "PROJECT.md").write_text("# Demo\n\n## What This Is\n\nA demo.\n")
+        (self.root / ".planning" / "research" / "questions.md").write_text(
+            "# Q\n\n## For Claude Science\n\n- [ ] SQ-001 (2026-11-06, user): open one\n"
+            "- [x] SQ-002 (2026-11-05, user): done — answered: x\n")
+        (self.root / "src.py").write_text("print('hi')\n")
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(code, 0, out)
+        git(self.root, "init", "-q")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "init")
+        self.inbox = self.root / "science" / "inbox"
+        self.selftest_path = self.inbox / "selftest.json"
+
+    def tearDown(self):
+        bridge.ssh_check = self._ssh
+        os.chmod(str(self.root), 0o755)
+
+    def selftest(self, *extra, readonly_root=True, env=None):
+        if readonly_root:
+            os.chmod(str(self.root), 0o555)  # what a Read-only grant of the repo root looks like
+        try:
+            proc = subprocess.run([sys.executable, str(SELFTEST), str(self.root)] + list(extra), capture_output=True,
+                                  text=True, timeout=60, env=env)
+        finally:
+            os.chmod(str(self.root), 0o755)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), read_json(self.selftest_path))
+        return read_json(self.selftest_path)
+
+    def verify(self, *extra):
+        return run(["--project-dir", str(self.root), "verify"] + list(extra))
+
+    def edit_selftest(self, **changes):
+        data = read_json(self.selftest_path)
+        for key, value in changes.items():
+            if "__" in key:
+                outer, inner = key.split("__")
+                data[outer][inner] = value
+            else:
+                data[key] = value
+        write_json(self.selftest_path, data)
+
+    def assert_no_probes(self):
+        self.assertFalse((self.root / ".science-bridge-write-probe").exists())
+        self.assertFalse((self.inbox / ".selftest-probe").exists())
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_end_to_end_ok_then_archived(self):
+        data = self.selftest()
+        self.assert_no_probes()
+        self.assertEqual(data["format"], "science-bridge-selftest/v1")
+        self.assertEqual(data["skill_version"], bridge.SKILL_VERSION)
+        self.assertEqual(data["write_probe_repo_root"], "denied")
+        self.assertEqual(data["inbox_write"], "ok")
+        self.assertEqual(data["requests_open"], ["SQ-001"])
+        self.assertEqual(data["repo"]["probe"]["path"], ".planning/PROJECT.md")
+        self.assertEqual(data["repo"]["git"], "cli")
+        self.assertIsNone(data["repo"]["error"])
+        self.assertEqual(data["policy"]["access"], "repo-readonly")
+        self.assertEqual(data["errors"], [])
+
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertTrue(out["selftest_pending"])
+        self.assertEqual((out["pending"], out["attachments"]), ([], []), "selftest.json is not a finding")
+        code, out = run(["--project-dir", str(self.root), "check"])
+        self.assertEqual(code, 0, out)
+
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(all(c["ok"] for c in out["checks"]))
+        names = [c["name"] for c in out["checks"]]
+        for name in ("present", "format", "fresh", "skill_version", "policy", "repo_read", "repo_head",
+                     "repo_files", "repo_probe", "requests_open", "write_probe_repo_root", "inbox_write"):
+            self.assertIn(name, names)
+        self.assertFalse(self.selftest_path.exists())
+        latest = self.root / "science" / "archive" / "selftest-latest.json"
+        self.assertEqual(read_json(latest)["skill_version"], bridge.SKILL_VERSION)
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertFalse(out["selftest_pending"])
+        self.assertEqual(out["last_selftest"]["skill_version"], bridge.SKILL_VERSION)
+        code, out = self.verify()
+        self.assertEqual((code, out["failed"]), (1, ["present"]))
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_new_commit_after_selftest_is_fine(self):
+        self.selftest()
+        (self.root / "more.py").write_text("x = 1\n")
+        git(self.root, "add", "more.py")
+        git(self.root, "commit", "-q", "-m", "more")
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+        head = next(c for c in out["checks"] if c["name"] == "repo_head")
+        self.assertIn("ancestor", head["detail"])
+
+    def test_writable_repo_root_fails_and_probe_is_cleaned_up(self):
+        data = self.selftest(readonly_root=False)
+        self.assertEqual(data["write_probe_repo_root"], "allowed")
+        self.assert_no_probes()
+        code, out = self.verify()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["failed"], ["write_probe_repo_root"])
+        check = next(c for c in out["checks"] if c["name"] == "write_probe_repo_root")
+        self.assertIn("Read-only", check["fix"])
+        self.assertTrue(self.selftest_path.exists(), "a failed verify leaves selftest.json in the inbox")
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_old_skill_unknown_head_and_stale_selftest_fail(self):
+        self.selftest()
+        self.edit_selftest(skill_version="0.1.0")
+        code, out = self.verify()
+        self.assertEqual(out["failed"], ["skill_version"])
+        fix = next(c for c in out["checks"] if c["name"] == "skill_version")["fix"]
+        self.assertIn("cs-setup", fix)
+
+        self.selftest()
+        self.edit_selftest(repo__git_head="f" * 40)
+        code, out = self.verify()
+        self.assertEqual(out["failed"], ["repo_head"])
+        self.assertNotIn("repo_files", [c["name"] for c in out["checks"]])
+        fix = next(c for c in out["checks"] if c["name"] == "repo_head")["fix"]
+        self.assertIn("Read-only under Files › Artifacts › Add folder…", fix)
+
+        self.selftest()
+        old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.edit_selftest(created=old)
+        code, out = self.verify()
+        self.assertEqual(out["failed"], ["fresh"])
+        code, out = self.verify("--max-age-hours", "48")
+        self.assertEqual(code, 0, out)
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_repo_and_requests_mismatch(self):
+        self.selftest()
+        self.edit_selftest(repo__error="PermissionError: denied", requests_open=["SQ-001", "SQ-009"])
+        (self.root / ".planning" / "PROJECT.md").write_text("# Demo, edited\n")
+        code, out = self.verify()
+        self.assertEqual(sorted(out["failed"]), ["repo_probe", "repo_read", "requests_open"])
+        req = next(c for c in out["checks"] if c["name"] == "requests_open")
+        self.assertIn("only in Claude Science's view: SQ-009", req["detail"])
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_selftest_respects_do_not_read(self):
+        policy = read_json(self.root / "science" / "policy.json")
+        policy["do_not_read"] = [".planning/*"]
+        write_json(self.root / "science" / "policy.json", policy)
+        project = self.root / ".planning" / "PROJECT.md"
+        questions = self.root / ".planning" / "research" / "questions.md"
+        os.chmod(str(project), 0)
+        os.chmod(str(questions), 0)  # any attempt to open them would show up as an error
+        try:
+            data = self.selftest()
+        finally:
+            os.chmod(str(project), stat.S_IRUSR | stat.S_IWUSR)
+            os.chmod(str(questions), stat.S_IRUSR | stat.S_IWUSR)
+        self.assertIsNone(data["repo"]["error"])
+        self.assertFalse(data["repo"]["probe"]["path"].startswith((".planning/", "science/")))
+        self.assertIn("do_not_read", data["requests_error"])
+        self.assertEqual(data["policy"]["do_not_read_count"], 1)
+        self.assertEqual(data["errors"], [])
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_selftest_without_git_cli_reads_dot_git(self):
+        cli = self.selftest()
+        empty_path = tempfile.mkdtemp()
+        files = self.selftest(env={**os.environ, "PATH": empty_path})
+        self.assertTrue(files["repo"]["git"].startswith("files"))
+        self.assertEqual(files["repo"]["git_head"], cli["repo"]["git_head"])
+        self.assertEqual(files["repo"]["tracked_files"], cli["repo"]["tracked_files"])
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_project_without_git(self):
+        shutil.rmtree(str(self.root / ".git"))
+        data = self.selftest()
+        self.assertIsNone(data["repo"]["git_head"])
+        self.assertEqual(data["repo"]["error"], data["repo"]["git_error"])
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+        (self.root / "science" / "archive" / "selftest-latest.json").rename(self.selftest_path)
+        self.edit_selftest(repo__error="PermissionError: x")
+        code, out = self.verify()
+        self.assertEqual(out["failed"], ["repo_read"])
+
+    def test_selftest_usage_and_bad_compute_never_raise(self):
+        proc = subprocess.run([sys.executable, str(SELFTEST)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("usage", json.loads(proc.stdout)["errors"][0])
+        data = self.selftest("--compute", "hpc=maybe", "--compute=lab=skipped:no VPN", "--compute", readonly_root=False)
+        self.assertEqual(data["compute"], [{"name": "lab", "result": "skipped", "detail": "no VPN"}])
+        self.assertEqual(len(data["errors"]), 2)
+        missing = Path(tempfile.mkdtemp()) / "nope"
+        proc = subprocess.run([sys.executable, str(SELFTEST), str(missing)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 1)
+        out = json.loads(proc.stdout)
+        self.assertFalse(out["policy"]["ok"])
+        self.assertIn("skipped", out["repo"]["error"])
+        self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_compute_hosts(self):
+        policy = read_json(self.root / "science" / "policy.json")
+        policy["compute"] = {"hpc": {"reach": "claude-code", "notes": "SLURM login node"},
+                             "lab": {"reach": "claude-science", "notes": "lab VPN"}}
+        write_json(self.root / "science" / "policy.json", policy)
+        calls = []
+        bridge.ssh_check = lambda host: (calls.append(host) or (True, "fake ok"))
+        self.selftest("--compute", "lab=ok:reached it")
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(calls, ["hpc"])
+
+        bridge.ssh_check = lambda host: (False, "Permission denied (publickey)")
+        self.selftest("--compute", "lab=failed:no route")
+        code, out = self.verify()
+        self.assertEqual(sorted(out["failed"]), ["compute:hpc", "compute:lab"])
+        hpc = next(c for c in out["checks"] if c["name"] == "compute:hpc")
+        self.assertIn("`! ssh hpc` once in Claude Code to log in (Claude Code reuses that login)", hpc["fix"])
+        lab = next(c for c in out["checks"] if c["name"] == "compute:lab")
+        self.assertIn("no route", lab["detail"])
+
+        self.selftest()  # Claude Science did not test "lab" at all
+        bridge.ssh_check = lambda host: (True, "fake ok")
+        code, out = self.verify()
+        self.assertEqual(out["failed"], ["compute:lab"])
+
+    def test_compute_check_runs_ssh_with_batch_mode(self):
+        policy = read_json(self.root / "science" / "policy.json")
+        policy["compute"] = {"hpc": {"reach": "claude-code"}, "lab": {"reach": "claude-science"}}
+        write_json(self.root / "science" / "policy.json", policy)
+        fake = Path(tempfile.mkdtemp()) / "fake-ssh"
+        log = fake.with_name("args.txt")
+        fake.write_text('#!/bin/sh\necho "$@" > "%s"\n[ "$FAKE_SSH_FAIL" = 1 ] && { echo "Permission denied" >&2; '
+                        'exit 255; }\nexit 0\n' % log)
+        fake.chmod(0o755)
+        old_env = dict(os.environ)
+        os.environ["SCIENCE_BRIDGE_SSH"] = str(fake)
+        try:
+            code, out = run(["--project-dir", str(self.root), "compute-check"])
+            self.assertEqual(code, 0, out)
+            self.assertEqual([c["name"] for c in out["checks"]], ["compute:hpc"])
+            self.assertEqual(log.read_text().split(), ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "hpc", "true"])
+            os.environ["FAKE_SSH_FAIL"] = "1"
+            code, out = run(["--project-dir", str(self.root), "compute-check"])
+            self.assertEqual(code, 1)
+            self.assertIn("Permission denied", out["checks"][0]["detail"])
+            self.assertIn("! ssh hpc", out["checks"][0]["fix"])
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        policy["compute"] = {}
+        write_json(self.root / "science" / "policy.json", policy)
+        code, out = run(["--project-dir", str(self.root), "compute-check"])
+        self.assertEqual((code, out["checks"]), (0, []))
+        self.assertIn("note", out)
+
+
+class ValidatorAdditions(unittest.TestCase):
+    def check(self, text, name="2026-11-06-x.md"):
+        p = Path(tempfile.mkdtemp()) / name
+        p.write_text(text)
+        return validate_finding(p)
+
+    def test_partial(self):
+        r = self.check(VALID.replace("contains_case_data: false", "contains_case_data: false\npartial: true"))
+        self.assertIn("partial: true needs answers: [SQ-NNN] (the requests this finding makes progress on)", r["errors"])
+        r = self.check(VALID.replace("contains_case_data: false", "contains_case_data: false\npartial: true\nanswers: [SQ-001]"))
+        self.assertTrue(r["ok"], r["errors"])
+        self.assertIs(r["meta"]["partial"], True)
+        r = self.check(VALID.replace("contains_case_data: false", "contains_case_data: false\npartial: false"))
+        self.assertTrue(r["ok"], r["errors"])
+        r = self.check(VALID.replace("contains_case_data: false", "contains_case_data: false\npartial: maybe"))
+        self.assertIn("partial must be true or false", r["errors"])
+
+    def test_compute(self):
+        proposal = VALID.replace("type: rule-check", "type: analysis-proposal").replace(
+            "contains_case_data: false", "contains_case_data: false\ncompute: hpc.example-1")
+        r = self.check(proposal)
+        self.assertTrue(any("### Run spec" in e for e in r["errors"]), r["errors"])
+        with_spec = proposal.replace("Table attached.", "Table attached.\n\n### Run spec\nsbatch run.sh")
+        r = self.check(with_spec)
+        self.assertTrue(r["ok"], r["errors"])
+        self.assertEqual(r["meta"]["compute"], "hpc.example-1")
+        r = self.check(with_spec.replace("type: analysis-proposal", "type: finding"))
+        self.assertIn("compute is only allowed when type is analysis-proposal", r["errors"])
+        r = self.check(with_spec.replace("compute: hpc.example-1", "compute: bad host!"))
+        self.assertTrue(any(e.startswith("compute must be a host name") for e in r["errors"]))
+        r = self.check(with_spec.replace("compute: hpc.example-1", "compute: [a, b]"))
+        self.assertTrue(any(e.startswith("compute must be a host name") for e in r["errors"]))
+
+
+class PartialArchive(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / ".planning" / "research").mkdir(parents=True)
+        run(["--project-dir", str(self.root), "init"])
+        bridge.ensure_requests_section(self.root)
+        run(["--project-dir", str(self.root), "ask", "Review all six sites"])
+        run(["--project-dir", str(self.root), "ask", "Second question"])
+        self.q = self.root / ".planning" / "research" / "questions.md"
+
+    def archive(self, name, extra):
+        text = VALID.replace("affects: [LBL-01, LBL-06]", "affects: [LBL-01]\n" + extra)
+        (self.root / "science" / "inbox" / name).write_text(text)
+        return run(["--project-dir", str(self.root), "archive", name, "--route", "note", "--ref", "n"])
+
+    def test_partial_appends_progress_and_does_not_tick(self):
+        code, out = self.archive("2026-11-06-part-one.md", "answers: [SQ-001, SQ-404]\npartial: true")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["requests"], {"progress": ["SQ-001"], "already": [], "closed": [], "unknown": ["SQ-404"]})
+        text = self.q.read_text()
+        self.assertIn("- [ ] SQ-001", text)
+        self.assertIn("Review all six sites — progress: science/archive/2026-11-06-part-one.md", text)
+        self.assertEqual(text.count("progress:"), 1)
+        record = json.loads((self.root / "science" / "archive" / "routing.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(record["requests"]["progress"], ["SQ-001"])
+        code, out = run(["--project-dir", str(self.root), "requests"])
+        self.assertEqual([r["id"] for r in out["items"]], ["SQ-001", "SQ-002"])
+
+        code, out = self.archive("2026-11-07-part-two.md", "answers: [SQ-001]\npartial: true")
+        self.assertEqual(out["requests"]["progress"], ["SQ-001"])
+        self.assertEqual(self.q.read_text().count("progress:"), 2)
+
+        code, out = self.archive("2026-11-08-final.md", "answers: [SQ-001]")
+        self.assertEqual(out["requests"]["ticked"], ["SQ-001"])
+        line = next(l for l in self.q.read_text().splitlines() if "SQ-001" in l)
+        self.assertTrue(line.startswith("- [x] SQ-001"))
+        self.assertTrue(line.endswith("answered: science/archive/2026-11-08-final.md"))
+        self.assertIn("progress: science/archive/2026-11-06-part-one.md", line)
+
+        code, out = self.archive("2026-11-09-late.md", "answers: [SQ-001]\npartial: true")
+        self.assertEqual(out["requests"]["closed"], ["SQ-001"])
+        code, out = run(["--project-dir", str(self.root), "ask", "review all six sites"])
+        self.assertEqual(code, 1, "dedupe still sees through progress notes")
 
 
 if __name__ == "__main__":

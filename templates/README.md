@@ -1,30 +1,21 @@
-# Science handoff: <project name>
+# Science handoff: {{project_name}}
 
-This project works with **Claude Science** through this `science/` folder (science-bridge, format `science-finding/v0.1`, see the science-findings skill's `references/format.md`).
+<!-- science-bridge:managed:start -->
+<!-- Managed by science-bridge: `/science-bridge:bridge init` rewrites this block. Put your own notes in the Project brief below. -->
 
-- **Access** (see `policy.json`): `repo-readonly`. Claude Science may read the whole repo, read-only: code, `.planning/`, git history. The exceptions are paths in `do_not_read`.
-- `inbox/` is the only place Claude Science writes: one markdown finding per file, validated.
-- `archive/` holds findings already routed into `.planning/`, plus `routing.jsonl`.
-- **Request queue:** `.planning/research/questions.md` → `## For Claude Science` (SQ-NNN items).
-- `outbox/` is optional, for files that live outside the repo. Only `bridge.py export` writes there.
+This project works with **Claude Science** through this `science/` folder (science-bridge). The rules for Claude Science live in its `science-findings` skill. This page only says where things are.
 
-## Rules for Claude Science
-
-1. Before every task, run the duplicate-work check from the skill: archive and inbox, then `.planning/`, the code and `git log`. Build on what exists, and don't redo it.
-2. Write only to `inbox/`. Never edit code or `.planning/`, and never commit.
-3. Never open `do_not_read` paths.
-4. No patient- or case-level data in findings.
-5. Answer queued questions with findings that set `answers: [SQ-NNN]`.
+| What | Where |
+|---|---|
+| Access mode, `do_not_read`, compute hosts | `science/policy.json`: `access`, `do_not_read`, `compute` |
+| What Claude Science may read | `repo-readonly`: the whole repo, read-only, except `do_not_read` paths. The `export` block in `policy.json` only controls `bridge.py export`. It never limits what Claude Science reads. |
+| Where Claude Science writes | `science/inbox/` only |
+| Open questions for Claude Science | `.planning/research/questions.md` → `## For Claude Science` (SQ-NNN items) |
+| Earlier findings | `science/archive/`, with `science/archive/routing.jsonl` |
+| The project itself | `.planning/PROJECT.md`, `.planning/ROADMAP.md`, and `.planning/REQUIREMENTS.md` (IDs to cite in `affects`) |
+| Results of runs that Claude Code did for Claude Science | `science/runs/<finding-slug>/` |
+<!-- science-bridge:managed:end -->
 
 ## Project brief
 
-<!-- Fill in. Keep it short. -->
-
-**What the project is:** <one paragraph>
-
-**What we want from Claude Science:** see the request queue, plus:
-- <standing task, if any>
-
-**Where things are:** <key code / data / docs paths>
-
-**Requirement IDs to reference in `affects`:** see `.planning/REQUIREMENTS.md`, e.g. <IDs>
+{{brief}}

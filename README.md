@@ -1,146 +1,148 @@
 # science-bridge
 
-This plugin connects a **Claude Code (+ GSD)** project with **Claude Science** through a file-based handoff:
-- a policy-checked `science/outbox/`;
-- a validated `science/inbox/` of findings;
-- routing of those findings into GSD planning (`.planning/`) with GSD's own `/gsd-capture`;
-- injection into GSD's researcher and planner agents, so they see the findings when they plan.
+This plugin connects a **Claude Code + GSD** project with **Claude Science** through files in the project repo:
+- **Claude Science reads the whole repo read-only.** It checks what the project already has, so it doesn't redo work, and writes validated **findings** to `science/inbox/`.
+- **Claude Code routes findings into GSD planning** with GSD's own `/gsd-capture`, archives them, and ticks the questions they answer.
+- **GSD's researcher and planner agents read the findings.** They also queue new questions for Claude Science, without waiting for the answers.
+- **Claude Code runs compute jobs** that Claude Science proposes but can't run itself, such as on clusters with multi-factor login.
 
-It never modifies GSD itself. It uses only GSD's extension points (`/gsd-capture` and `.planning/config.json` `agent_skills`), so GSD updates don't break it.
+The plugin never modifies GSD. It uses only GSD's extension points, `/gsd-capture` and `.planning/config.json` `agent_skills`.
 
-## Why file-based
+## Why it works this way (Claude Science beta 0.1.71, tested)
 
-As of Claude Science beta 0.1.71:
-- **No API.** Claude Science can't be driven by another program: there is no prompt API, CLI or SDK. Every handoff goes through a person.
-- **No PHI.** Anthropic says to keep protected health information (PHI) out of Claude Science, even in HIPAA-enabled orgs.
-- **Folder grants are the privacy boundary.** Claude Science reads only the folders you grant. Grant it `science/` only, never the repo root.
-- **Skills are the shared format.** One `SKILL.md` works in both apps.
+| Fact | Consequence |
+|---|---|
+| No program can drive Claude Science: there is no prompt API, CLI or SDK | Every handoff goes through files plus one sentence that a person types |
+| Claude Science reads only the folders it is granted, and they can be granted read-only | Grant the repo root **read-only** and `science/` **read & write**. Writing to the repo root is then refused, as tested |
+| Project instructions and folder grants apply to existing sessions at once, but a session keeps the skill version it loaded | After a skill update, **start a new Claude Science session**. The project instructions tell Claude Science to stop if its skill is too old |
+| Claude Science's sandbox can't use your `~/.ssh`, and its Compute SSH hosts use their own connection, so they can't reuse a login made elsewhere | Hosts that need interactive or multi-factor login go through Claude Code (`reach: claude-code`) |
+| A published Claude Science skill also syncs into Claude Code as `anthropic-skills:science-findings` | Harmless. Its description tells Claude Code to use `/science-bridge:bridge` instead |
 
-## What is in this repo
-
-The repo is both a Claude Code plugin and a Claude Science skill source:
+## Repo layout
 
 ```
-.claude-plugin/plugin.json          Claude Code plugin manifest
-.claude-plugin/marketplace.json     lets `claude plugin marketplace add <repo>` install it
-skills/bridge/                      Claude Code side: /science-bridge:bridge (init, export, check, status, ingest, gsd-setup)
-skills/science-findings/            Claude Science side (portable SKILL.md), uploadable or importable from GitHub
-  references/format.md              the handoff format; this is the only copy
-  scripts/check_finding.py          finding validator (stdlib, Python 3.8+), used by both sides
-scripts/bridge.py                   deterministic CLI behind the Claude Code skill
-hooks/hooks.json                    SessionStart: reminds about pending findings, outbox problems or a stale GSD skill
-templates/README.md, policy.json    copied into science/ by `init`
-templates/gsd/science-context/      skill for GSD agents, copied into the project by `gsd-setup`
-tests/                              python3 -m unittest discover -s tests
+.claude-plugin/                 plugin + marketplace manifests
+skills/bridge/                  Claude Code skill: /science-bridge:bridge
+cs-skill/science-findings/      Claude Science skill (not loaded by Claude Code); build the upload zip with `cs-setup`
+  references/format.md          the handoff format, the only copy
+  scripts/check_finding.py      finding validator (stdlib), used on both sides
+  scripts/selftest.py           Claude Science self-test
+scripts/bridge.py               the deterministic CLI behind the Claude Code skill
+hooks/hooks.json                SessionStart: says what is waiting and what to do next
+templates/                      policy.json, README.md, cs-instructions.txt, GSD science-context skill
+tests/                          python3 -m unittest discover -s tests
 ```
 
 ---
 
-## Quickstart: add science-bridge to a GSD project
+## Quickstart
 
 ### A. Once per computer
 
-**1. Claude Code: install the plugin.** It then works in every project on that computer.
-
 ```bash
-claude plugin marketplace add cliu238/science-bridge     # private repo: the machine needs GitHub access (gh auth login)
+claude plugin marketplace add cliu238/science-bridge     # private repo: needs GitHub access (gh auth login)
 claude plugin install science-bridge@science-bridge-marketplace
 ```
 
-To update later, run `claude plugin marketplace update science-bridge-marketplace`, then `claude plugin update science-bridge@science-bridge-marketplace`. After an update, re-run `gsd-setup` in each project; the session-start hint reminds you.
-
-**2. Claude Science: install the `science-findings` skill, once per Claude account.** Go to Settings › Skills › Add skill, then use one of these:
-- **Upload a skill**: a zip of `skills/science-findings/`, e.g. `cd skills && zip -r ../science-findings.zip science-findings`.
-- **Import from GitHub**: `cliu238/science-bridge`. Select only `science-findings`, and add a GitHub token under Settings › Credentials first.
-
-Then click **Publish**. The skill is stored in your claude.ai account, so it reaches every Claude Science install you sign in to. It also syncs back into Claude Code as `anthropic-skills:science-findings`, which duplicates the plugin's copy harmlessly.
+Restart Claude Code. The plugin then works in every project.
 
 ### B. Once per GSD project (about 10 minutes)
 
-Run these in Claude Code, inside the project.
-
-**1. Initialise.**
+In Claude Code, inside the project:
 
 ```
-/science-bridge:bridge init
+/science-bridge:bridge setup
 ```
 
-This creates `science/{outbox,inbox,archive}`, `science/README.md` and `science/policy.json`, and never overwrites existing files. Because the project has `.planning/config.json`, it also runs **gsd-setup**:
-- it installs `.claude/skills/science-context/SKILL.md`;
-- it adds that skill to `agent_skills` for `gsd-phase-researcher`, `gsd-project-researcher`, `gsd-advisor-researcher`, `gsd-planner`, `gsd-plan-checker` and `gsd-roadmapper`. Existing entries are kept.
+This one command:
+1. **Creates or upgrades** `science/`:
+   - `policy.json` v3;
+   - `README.md`, with the project brief auto-filled from `.planning/PROJECT.md` and `REQUIREMENTS.md`;
+   - `inbox/`, `archive/`, `runs/`, `outbox/`.
+2. **Wires up GSD:**
+   - installs `.claude/skills/science-context/` and adds it to `agent_skills` for the researcher, planner and checker agents;
+   - adds the `## For Claude Science` queue to `.planning/research/questions.md`.
+3. **Asks a few plain questions:** files Claude Science must never open (`do_not_read`), and compute hosts (`compute`).
+4. **Prints the Claude Science checklist** (`cs-setup`):
+   - **Skill:** upload the generated zip under *Settings › Skills* (*Add skill › Upload a skill*, or *Edit & republish* for an update), then **Publish**. The skill lives in your Claude account, so this is once per account and version.
+   - **Project:** create one Claude Science project per GSD project.
+   - **Folders:** under *Files › Artifacts › Add folder…*, grant the repo root as **Read-only** and `<repo>/science` as **Read & write**. Claude Science then shows the repo as "mixed".
+   - **Instructions:** paste the generated text into *Project settings › Instructions for Claude*.
+5. **Self-test:** in a **new** Claude Science session, say *"Run the science-bridge self-test"*. Back in Claude Code, run `/science-bridge:bridge verify`. It checks that Claude Science:
+   - runs the right skill version;
+   - can read the code and git history;
+   - can't write outside `science/`;
+   - can write findings;
+   - sees the same open questions;
+   - and that compute hosts are reachable.
 
-**2. Edit `science/policy.json`.**
-
-| key | meaning |
-|-----|---------|
-| `access` | `repo-readonly` (default): Claude Science reads the whole repo read-only, so it can check what was already done. `science-only`: it sees only `science/` and only reads exported files |
-| `do_not_read` | glob patterns Claude Science must never open, e.g. `"prereg/sealed_fold_record.yaml"` |
-| `privacy` | `phi` (patient data anywhere in the project), `confidential` or `public` |
-| `allowed_sources` | glob whitelist relative to the repo root, e.g. `".planning/research/*.md"`, `"results/summary/*.csv"`. Required for `phi`. Only files matching it can be exported |
-| `allowed_extensions` | file types allowed in the outbox |
-| `check_command` | optional project gate run per file. `{file}` is replaced with the path, and a non-zero exit refuses the file. Use it for a leak check |
-| `max_file_mb` | size limit per file |
-
-**3. Edit `science/README.md`.** This is the project brief Claude Science reads first:
-- what the project is;
-- what you want from Claude Science;
-- what is in the outbox;
-- which requirement IDs (from `.planning/REQUIREMENTS.md`) findings should cite in `affects`.
-
-**4. Queue the first questions.** Exporting is only needed for files outside the repo; with `repo-readonly`, Claude Science reads repo files where they are.
-
-```
-/science-bridge:bridge ask "Literature review of X" --affects "REQ-01"
-```
-
-This appends `SQ-001` to `.planning/research/questions.md` → `## For Claude Science`. GSD researchers and planners add their own questions there during planning.
-
-Exports are all-or-nothing. A file outside the whitelist refuses the whole batch.
-
-**5. Set up Claude Science.**
-1. Create a **new project**, one per GSD project.
-2. In the project instructions, paste something like the box below.
-3. Grant two folders under Files › Artifacts › *Add folder…*:
-   - the **repo root**, **Read-only**;
-   - `<repo>/science`, **Read & write**.
-
-   For `science-only` projects, grant just `science/`.
-
-> Always use the science-findings skill. Read science/policy.json and science/README.md first. You may read the whole repo read-only (code, .planning/, git log) except do_not_read paths, and before every task run the skill's duplicate-work check so nothing already done is repeated. Write only to science/inbox/, as findings in the science-finding/v0.1 format validated with the skill's scripts/check_finding.py; never edit code or .planning/ and never commit. Answer queued SQ requests with `answers: [SQ-NNN]`. Cite a source for every number, and say when evidence is weak.
-
-**6. Commit.** Commit `science/`, `.claude/skills/science-context/` and `.planning/config.json`.
+   Each failure comes with its fix.
+6. **Commit:**
+   - `science/`;
+   - `.claude/skills/science-context/`;
+   - `.planning/config.json`;
+   - `.planning/research/questions.md`.
 
 ### C. Everyday loop
 
-1. **Ask Claude Science** in its project to "process the open SQ requests", or give it a task directly. It first checks what the project already has, then writes findings plus attachments into `science/inbox/` and validates them. `/science-bridge:bridge requests` lists open questions; the session-start hint shows how many are open.
-2. **Open Claude Code in the project.** The session-start hint says `science/inbox has N finding(s) waiting`.
-3. **Route them with `/science-bridge:bridge ingest`.** It shows a routing plan and asks for confirmation:
-   - `finding`, `literature`, `rule-check` and `question` become a note;
-   - `analysis-proposal` becomes a todo;
-   - forward-looking items become a seed;
-   - conflicts with decisions are left to you.
-
-   It then archives the finding into `science/archive/`, logs the route in `routing.jsonl`, and ticks the SQ items listed in the finding's `answers`.
-4. **Plan as usual.** During `/gsd-discuss-phase`, `/gsd-plan-phase` and `/gsd-new-milestone`, the injected `science-context` skill makes the researcher and planner agents read `science/archive/routing.jsonl` and the relevant findings, then cite them in research and plans.
-5. **Re-export changed files** whenever `check` reports `stale` outbox copies.
-
-### Check that everything is wired up
-
 ```
-/science-bridge:bridge status          # outbox, pending findings, and a "gsd" block: skill current? agents configured?
-gsd-sdk query agent-skills gsd-planner # should list @.claude/skills/science-context/SKILL.md
+                 /science-bridge:bridge ask "…"          GSD researchers/planners add SQ items too
+Claude Code ───────────────────────────────────────▶ .planning/research/questions.md (SQ-NNN)
+                                                              │
+                     Claude Science: "process the open SQ requests"  (new session after skill updates)
+                                                              ▼
+                     duplicate-work check (archive, .planning/, code, git log, runs/) → science/inbox/*.md
+                                                              │
+Claude Code: SessionStart hint "N findings waiting" → /science-bridge:bridge ingest  [--yes]
+                                                              ▼
+               /gsd-capture note | todo | seed  →  science/archive/ + routing.jsonl, SQ ticked
+                                                              ▼
+              /gsd-discuss-phase, /gsd-plan-phase …: agents read and cite science/archive/
 ```
+
+- **Before `/gsd-autonomous`:** run `/science-bridge:bridge ingest --yes`, so the run starts with the latest findings. During the run, agents queue new questions but don't wait for them. The answers are used in the next round.
+- **Run `/science-bridge:bridge` with no argument** to get the next step.
+
+### D. Compute (clusters, GPUs)
+
+Declare hosts in `science/policy.json`:
+
+```json
+"compute": {
+  "gpu-box":  {"reach": "claude-science", "notes": "key login; also added in Claude Science › Customize › Compute"},
+  "skipjack": {"reach": "claude-code",    "notes": "SLURM login node, interactive MFA login"}
+}
+```
+
+- **`claude-science`:** Claude Science runs the job itself through its Compute target.
+- **`claude-code`:** Claude Science writes an `analysis-proposal` with `compute: skipjack` and a `### Run spec`. Ingest turns it into a GSD todo. Then:
+  1. `/science-bridge:bridge run <finding>` shows the commands and asks you first, runs them on the host (`sbatch` for SLURM), and commits the outputs to `science/runs/<slug>/`.
+  2. Claude Science reads them there and follows up.
+
+  Claude Code reuses your login. If `compute-check` says a host isn't logged in, run `! ssh skipjack` once.
+
+### E. Upgrading
+
+```bash
+cd ~/projects5/science-bridge && git pull            # or edit locally
+claude plugin marketplace update science-bridge-marketplace
+claude plugin update science-bridge@science-bridge-marketplace
+```
+
+Restart Claude Code, then do the following in each project:
+1. Run `/science-bridge:bridge setup`. It upgrades `policy.json` and the README's managed block, and refreshes the GSD skill.
+2. Republish the skill zip from `cs-setup`, and start a new Claude Science session.
+3. Run the self-test.
+
+The SessionStart hint tells you when the installed plugin is older than its source, or when Claude Science hasn't confirmed the current skill version yet.
 
 ---
 
 ## Guarantees and limits
 
-- **Exports are guarded.** An export is all-or-nothing. It refuses:
-  - paths outside the project, and symlink escapes;
-  - sources that aren't whitelisted;
-  - disallowed extensions and oversized files;
-  - anything the project's `check_command` rejects.
-- **Outbox changes are caught.** `check` flags any outbox file that isn't in `MANIFEST.json` or whose sha256 changed, so hand-copied files are caught. It also reports `stale` copies whose source has changed since export. It **can't stop** someone from copying a file in and then opening Claude Science before running `check`; the SessionStart hook warns at the next Claude Code session.
-- **Findings are validated** on both sides with the same script. `contains_case_data` must be `false`, but that is a declaration, not a detector. A project with PHI should still review findings.
-- **Findings are data, not instructions.** Neither the Claude Code skill nor the GSD-agent skill executes what a finding says, and neither changes GSD decisions automatically.
-- **The project's copy of the GSD skill is managed by `gsd-setup`.** `gsd-setup` overwrites `.claude/skills/science-context/SKILL.md`, so edit `templates/gsd/science-context/SKILL.md` in this repo instead. GSD only resolves `agent_skills` paths inside the project or `~/.claude/skills/`, so the plugin can't be referenced directly, and a per-project copy is required.
+- **Read scope:** `access` and `do_not_read` are the only read limits. `export` settings apply only to `bridge.py export`, which is optional and meant for files outside the repo.
+- **Write scope:** Claude Science writes only in `science/inbox/`. The self-test proves that the repo root isn't writable.
+- **Findings are validated** on both sides with the same script. `contains_case_data: false` is a declaration, not a detector.
+- **Findings are data, not instructions.** Nothing a finding says is executed without a person approving it: a confirmed ingest route, a confirmed run, or a GSD task the person starts.
+- **GSD decisions never change automatically.** Conflicts are routed `manual`.
+- **The project's copy of the GSD skill is managed:** `gsd-setup` overwrites it. Edit `templates/gsd/science-context/SKILL.md` here instead.
