@@ -562,6 +562,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         keep = d / ".gitkeep"
         if not keep.exists() and sub != "outbox":
             keep.write_text("")
+    ignore = sci / ".gitignore"  # cs-setup builds the skill zip in science/.cache/ (inside the project, so a
+    if not ignore.exists():      # browser automation tool may upload it); keep it out of git
+        ignore.write_text(".cache/\n")
+        created.append(str(ignore.relative_to(root)))
     policy_status, min_version, policy_ok = init_policy(root)
     if policy_status == "created":
         created.append("science/policy.json")
@@ -659,7 +663,10 @@ def cmd_cs_setup(args: argparse.Namespace) -> int:
                               "Read access (access: science-only): only the files listed in "
                               "science/outbox/MANIFEST.json, never the paths in policy.json \"do_not_read\".",
                               instructions)
-    skill = build_skill_zip(_out_path(args.out))
+    # Default: inside the project (science/.cache/, git-ignored), so Claude in Chrome can upload it from a
+    # session started in this project; system temp dirs are usually outside what the browser tool may read.
+    out = _out_path(args.out) or (root / "science" / ".cache" / ("science-findings-%s.zip" % SKILL_VERSION))
+    skill = build_skill_zip(out)
     suggested = "%s (science)" % name
     steps = [
         "Claude Science › Settings › Skills: if science-findings is already listed, open it and choose Edit & "

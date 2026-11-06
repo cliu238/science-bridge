@@ -89,7 +89,9 @@ If you operate Claude Science at `http://localhost:8765` on the user's behalf:
 - **Answer Claude Science's questions only when the answer is already settled**, in `.planning/` or by the user. Otherwise relay the question to the user, in plain words.
 - **Use a tab you opened yourself.** A background tab of a Chrome window can't be screenshotted.
 - **Send messages only when Claude Science is idle.** After the answer it often shows "Reviewing" while its built-in Reviewer runs. A message typed then can be lost. Wait until the composer is free, send, and then check that your message appears in the conversation.
-- **Find files by their HTML.** For uploads, locate the skill dialog's own file input (`accept=".md,.zip,.skill"`), not the chat attachment input.
+- **Find files by their HTML.** For uploads, locate the skill dialog's own file input (`accept=".md,.zip,.skill"`), not the chat attachment input. Upload the zip from `science/.cache/`, where `cs-setup` builds it inside the project. The browser tool can't read system temp folders.
+- **Check the prerequisites first.** You need the Claude in Chrome extension, signed in with the same account; site access for `http://localhost:8765`; and Claude Code started with Chrome enabled. If the extension isn't connected or the page is blocked, tell the user which of these is missing (see the README section "Let Claude Code drive Claude Science"). Don't keep retrying.
+- **Never type passwords or complete MFA logins.** Ask the user, for example to run `! ssh <host>` once.
 
 ## verify: check the self-test
 

@@ -95,7 +95,7 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
 - Claude Science (tested with beta 0.1.71), signed in to the same Claude account.
 - Python 3.8+ (standard library only).
 - Optional:
-  - Claude in Chrome, so Claude Code can do the Claude Science UI steps for you;
+  - Claude in Chrome, so Claude Code can do the Claude Science UI steps for you (see "Let Claude Code drive Claude Science" for the permissions it needs);
   - ssh access to your cluster.
 
 ## Install (once per computer)
@@ -124,6 +124,23 @@ Restart Claude Code. The plugin then works in every project.
    - `.claude/skills/science-context/`;
    - `.planning/config.json`;
    - `.planning/research/questions.md`.
+
+## Optional: let Claude Code drive Claude Science (Claude in Chrome)
+
+Claude Science runs as a local web app at `http://localhost:8765`. With **Claude in Chrome**, Claude Code can do the Claude Science steps for you: upload and publish the skill, add the folders, paste the instructions, start sessions, send requests and watch progress. You need to grant these permissions once:
+
+| Where | What to allow |
+|---|---|
+| Chrome | Install the **Claude in Chrome** extension and sign in with the **same Claude account** as Claude Code. If this is the first install, restart Chrome. |
+| Claude in Chrome extension | Site access for **`http://localhost:8765`** (or "on all sites"). Without it, the page is blocked and screenshots fail. |
+| Claude Code | Start it with Chrome enabled (`claude --chrome`). The first time it uses the browser tools (navigate, click, type, screenshot, file upload), it asks for permission. Allow them for this work. |
+| File upload | The browser tool can upload only files that the session may share. `cs-setup` therefore builds the skill zip **inside the project**, at `science/.cache/science-findings-<version>.zip` (git-ignored). If you build it elsewhere, copy it into the project first. |
+| Claude Science | Its own prompts ("Waiting for your approval": package installs, network domains, compute). Claude Code approves those that fit the task, with scope **"This project"**. It asks you about anything else. Pre-approved items can be reviewed or revoked under *Settings › Permissions*. |
+
+Keep in mind:
+- **Keep the Chrome window open and not minimised.** Claude Code works in a tab of its own, because a background tab can't be screenshotted.
+- **Claude Code never types passwords** or completes multi-factor logins for you. For example, `ssh skipjack` with JHED + MFA must be done by you, with `! ssh skipjack` in Claude Code.
+- **Everything works without Chrome too:** do the checklist from `cs-setup` by hand, and type the requests in Claude Science yourself.
 
 ## Everyday use: what to say where
 

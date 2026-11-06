@@ -907,6 +907,17 @@ class ClaudeScienceSetup(unittest.TestCase):
         self.assertEqual(Path(out["zip"]), self.tmp / "science-bridge" / ("science-findings-%s.zip" % bridge.SKILL_VERSION))
         self.assertTrue(Path(out["zip"]).is_file())
 
+    def test_cs_setup_default_zip_inside_project_and_gitignored(self):
+        root = (self.tmp / "proj2").resolve()
+        root.mkdir()
+        run(["--project-dir", str(root), "init"])
+        self.assertEqual((root / "science" / ".gitignore").read_text(), ".cache/\n")
+        code, out = run(["--project-dir", str(root), "cs-setup"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(Path(out["skill_zip"]),
+                         root / "science" / ".cache" / ("science-findings-%s.zip" % bridge.SKILL_VERSION))
+        self.assertTrue(Path(out["skill_zip"]).is_file())
+
     def test_cs_setup_grants_instructions_and_steps(self):
         root = (self.tmp / "proj").resolve()
         (root / ".planning").mkdir(parents=True)
