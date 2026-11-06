@@ -26,11 +26,11 @@ This document defines the shared handoff format between a Claude Code (+ GSD) pr
 {
   "policy_version": 3,
   "access": "repo-readonly",
-  "do_not_read": ["prereg/sealed_fold_record.yaml"],
+  "do_not_read": ["holdout/sealed_test_split.yaml"],
   "privacy": "confidential",
   "skill_min_version": "0.4.0",
   "compute": {
-    "skipjack": {"reach": "claude-code", "notes": "SLURM login node; interactive MFA login"}
+    "hpc": {"reach": "claude-code", "notes": "SLURM login node; interactive MFA login"}
   },
   "export": {
     "allowed_sources": [], "allowed_extensions": [".md", ".csv"], "check_command": null, "max_file_mb": 50
@@ -176,7 +176,7 @@ Depending on what it finds:
 
 ```markdown
 ## Suggested action
-Run the bootstrap on skipjack and report the CI table.
+Run the bootstrap on hpc and report the CI table.
 
 ### Run spec
 - run: `sbatch scripts/bootstrap_ci.sbatch` (module load python/3.11)

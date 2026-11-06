@@ -98,23 +98,34 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
   - Claude in Chrome, so Claude Code can do the Claude Science UI steps for you (see "Let Claude Code drive Claude Science" for the permissions it needs);
   - ssh access to your cluster.
 
+## What gets installed where, and how often
+
+| What | Where | How often | Who does it |
+|---|---|---|---|
+| The science-bridge **plugin** | Claude Code | once per computer | you, two commands (below) |
+| The `science-findings` **skill** | Claude Science, *Settings › Skills* | once per **Claude account**, and again when the skill version changes | `cs-setup` builds the zip; you or Claude Code (via Chrome) upload and publish it |
+| The **`science/` folder** and GSD wiring | the project repo | once per project | `/science-bridge:bridge setup` |
+| A **Claude Science project**, with 2 folder grants and instructions | Claude Science | once per project | you or Claude Code (via Chrome), following `cs-setup` |
+
+Nothing else needs installing: no Claude Science plugin, no API key and no server. A published skill stays in your Claude account, so a second project on the same account skips the skill step.
+
 ## Install (once per computer)
 
 ```bash
-claude plugin marketplace add cliu238/science-bridge     # private repo: needs GitHub access (gh auth login)
+claude plugin marketplace add cliu238/science-bridge
 claude plugin install science-bridge@science-bridge-marketplace
 ```
 
-Restart Claude Code. The plugin then works in every project.
+Restart Claude Code. The plugin then works in every project. If the repo is private, the computer needs GitHub access first (`gh auth login`).
 
 ## Set up a project (once per GSD project, about 10 minutes)
 
-1. **In Claude Code**, inside the project: `/science-bridge:bridge setup`. It:
+1. **In Claude Code**, inside the project, run `/science-bridge:bridge setup`. It:
    - creates or upgrades `science/` and wires up GSD;
    - asks which files Claude Science must never open, and which compute hosts you use;
    - prints the Claude Science checklist.
 2. **In Claude Science**, follow the checklist. Claude Code can do these steps through Chrome if you let it.
-   - **Skill:** upload the generated zip under *Settings › Skills* (*Add skill › Upload a skill*, or *Edit & republish*), then **Publish**. This is once per Claude account and skill version.
+   - **Skill:** skip this step if `science-findings` is already listed under *Settings › Skills* with the version `cs-setup` reports. Otherwise upload the generated zip (*Add skill › Upload a skill*, or *Edit & republish* for an update), then **Publish**.
    - **Project:** create one Claude Science project per repo.
    - **Folders:** under *Files › Artifacts › Add folder…*, add the repo root as **Read-only** and `<repo>/science` as **Read & write**.
    - **Instructions:** paste the generated text into *Project settings › Instructions for Claude*.
@@ -124,6 +135,65 @@ Restart Claude Code. The plugin then works in every project.
    - `.claude/skills/science-context/`;
    - `.planning/config.json`;
    - `.planning/research/questions.md`.
+
+## Example: adding science-bridge to an existing GSD project
+
+This example is a research repo `~/code/my-study`. It already uses GSD, has a sealed hold-out file that Claude Science must never see, and runs jobs on a SLURM cluster reached as `ssh hpc`, which needs multi-factor login.
+
+**1. Start Claude Code in the project**, with Chrome if you want it to do the Claude Science steps:
+
+```bash
+cd ~/code/my-study
+claude --chrome          # or just `claude`, and do the Claude Science steps by hand
+```
+
+**2. Paste one prompt.** Claude Code asks before anything you need to approve.
+
+```text
+Set up science-bridge for this project:
+1. Run /science-bridge:bridge setup. In science/policy.json, set do_not_read to
+   ["holdout/sealed_test_split.yaml"]. Add a compute host "hpc" with reach "claude-code"
+   (interactive MFA login; jobs are run from Claude Code with sbatch, see cluster/).
+2. Run /science-bridge:bridge cs-setup. Then use Chrome to do the Claude Science steps at
+   http://localhost:8765:
+   - publish the skill if needed;
+   - create the project;
+   - add the two folders (repo Read-only, science/ Read & write);
+   - paste the instructions.
+   When Claude Science asks for approval, approve what fits the task, with scope "This project".
+3. In a NEW Claude Science session, say "Run the science-bridge self-test", then run
+   /science-bridge:bridge verify until every check passes.
+4. Queue the first questions with /science-bridge:bridge ask (cite requirement IDs from
+   .planning/REQUIREMENTS.md in --affects).
+5. Commit science/, .claude/skills/science-context/ and .planning/.
+```
+
+**3. What you do by hand:**
+- **Approve permission prompts:** Claude Code's own (browser tools, shell commands) and Claude Science's.
+- **Log in to the cluster.** When `compute-check` says `hpc` isn't logged in, type `! ssh hpc` and finish the multi-factor login. Claude Code reuses that login.
+- **If you didn't use Chrome,** do the `cs-setup` checklist yourself in Claude Science and say the self-test sentence there.
+
+**4. The result.** `verify` prints one line per check, for example:
+
+```
+PASS skill_version  - Claude Science runs science-findings 0.4.0; policy.json requires >= 0.4.0
+PASS repo_head      - same HEAD d38233b3a954
+PASS write_probe_repo_root - creating …/.science-bridge-write-probe from Claude Science: denied
+PASS compute:hpc    - from Claude Code: `ssh hpc true` succeeded
+```
+
+**5. From then on:**
+- in Claude Science, say "process the open SQ requests";
+- in Claude Code, run `/science-bridge:bridge ingest`;
+- plan with GSD as usual.
+
+## Sharing with colleagues
+
+- **Each colleague installs the plugin on their computer** (Install, above). A public repo needs no GitHub login.
+- **Each colleague publishes the skill once in their own Claude Science**, because skills belong to a Claude account. `cs-setup` builds the zip in their project at `science/.cache/`.
+- **A project that is already set up:**
+  - **Already in the repo, nothing to redo:** `science/`, the policy and the GSD wiring.
+  - **Each colleague does:** create their own Claude Science project with the two folder grants on their clone, paste the `cs-setup` instructions, and run the self-test.
 
 ## Optional: let Claude Code drive Claude Science (Claude in Chrome)
 
@@ -139,7 +209,7 @@ Claude Science runs as a local web app at `http://localhost:8765`. With **Claude
 
 Keep in mind:
 - **Keep the Chrome window open and not minimised.** Claude Code works in a tab of its own, because a background tab can't be screenshotted.
-- **Claude Code never types passwords** or completes multi-factor logins for you. For example, `ssh skipjack` with JHED + MFA must be done by you, with `! ssh skipjack` in Claude Code.
+- **Claude Code never types passwords** or completes multi-factor logins for you. For example, an ssh login to a cluster with multi-factor authentication must be done by you, with `! ssh <host>` in Claude Code.
 - **Everything works without Chrome too:** do the checklist from `cs-setup` by hand, and type the requests in Claude Science yourself.
 
 ## Everyday use: what to say where
@@ -178,7 +248,7 @@ Declare the hosts in `science/policy.json`:
 ```json
 "compute": {
   "gpu-box":  {"reach": "claude-science", "notes": "key login; also added in Claude Science › Customize › Compute"},
-  "skipjack": {"reach": "claude-code",    "notes": "SLURM login node, interactive MFA login"}
+  "hpc":      {"reach": "claude-code",    "notes": "SLURM login node, interactive MFA login"}
 }
 ```
 
@@ -191,8 +261,7 @@ Declare the hosts in `science/policy.json`:
 ## Upgrading
 
 ```bash
-cd ~/projects5/science-bridge && git pull      # or edit locally
-claude plugin marketplace update science-bridge-marketplace
+claude plugin marketplace update science-bridge-marketplace   # fetches the latest version
 claude plugin update science-bridge@science-bridge-marketplace
 ```
 
