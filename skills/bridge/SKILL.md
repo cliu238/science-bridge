@@ -1,7 +1,7 @@
 ---
 name: bridge
 description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up or upgrade a science/ handoff folder, prepare the one-time Claude Science setup, verify Claude Science's self-test, queue a question for Claude Science, route findings from science/inbox/ into GSD planning, or run a compute job Claude Science proposed. Triggers include "science inbox", "Claude Science findings", "set up Claude Science", "self-test", "处理 Claude Science 的结论", "给 Claude Science 提问", "science-bridge".
-argument-hint: "[setup | cs-setup | verify | ask <question> | requests | ingest [--yes] | run <finding> | status | check | gsd-setup | export <paths…> | outbox-clean [--yes]]"
+argument-hint: "[setup | cs-setup | verify | ask <question> | wait | requests | ingest [--yes] | run <finding> | status | check | gsd-setup | export <paths…> | outbox-clean [--yes]]"
 ---
 
 # science-bridge: Claude Code side
@@ -116,6 +116,36 @@ When all checks pass, it archives the result as `science/archive/selftest-latest
 - `requests [--all]` lists open items, or all items with `--all`.
 
 Claude Science answers with findings that set `answers: [SQ-NNN]`, plus `partial: true` when they cover only part of an item. Archiving ticks fully answered items, and adds a progress link for partial ones.
+
+## Waiting for Claude Science: watch it yourself, don't make the user watch
+
+Claude Science has no API, so you can't ask it whether it's done. But its results always arrive as files in `science/inbox/`, so watch that folder. Start watching **on your own initiative**, without being asked, whenever Claude Science has been given work. That happens when:
+- you sent a request through Chrome;
+- the user says they asked it something, or that "it answered";
+- right after `ask`, if the user is about to ask Claude Science to process the queue;
+- after asking for the self-test.
+
+1. **Start the watcher in the background** with the Bash tool (`run_in_background: true`), never with a foreground sleep:
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" --project-dir "$PWD" wait --timeout 120
+   ```
+
+   Then tell the user in one line that they don't need to watch, because you'll be notified when the files arrive. `wait` waits until the folder has been quiet for 20 s, so half-written files aren't picked up.
+2. **Exit 0 means something arrived.** Its JSON lists the files and `next`. Then:
+   - for `selftest.json`, run **verify**;
+   - for findings, run **ingest**. Use `--yes` only if the user pre-approved default routes.
+
+   Don't report results before this notification arrives.
+3. **Exit 2 means a timeout with nothing new.** Find out why:
+   - **With Chrome:** look at the Claude Science page.
+     - **"Waiting for your approval":** handle it under "Driving Claude Science".
+     - **A question:** relay it to the user, in plain words.
+     - **It finished but wrote no file:** ask it to "write the answer as a finding in science/inbox/".
+     - **Still working:** start `wait --timeout 120` again.
+   - **Without Chrome:** start `wait --timeout 1800` again. Tell the user once that it is still running, and that if it seems stuck they should look for an approval prompt in Claude Science.
+   - **Stop after about 2 hours with nothing new.** Report what you saw.
+4. **Already pending.** `wait` returns at once when findings are already waiting. Use `--new-only` to wait only for new ones.
 
 ## ingest [--yes]: route Claude Science findings into GSD
 

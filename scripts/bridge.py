@@ -48,6 +48,7 @@ Commands:
                                     .planning/research/questions.md "## For Claude Science")
   ask TEXT [--by WHO] [--context P] [--affects IDS]
                                     append a new SQ-NNN request with the next free number
+  wait [--timeout S] [--new-only]  block until Claude Science writes to science/inbox/ (exit 0) or time out (exit 2)
   session-hint                      for the SessionStart hook: print up to 6 one-line reminders
                                     when there is something to act on; otherwise print nothing.
                                     Always exits 0.
@@ -1617,6 +1618,80 @@ SESSION_HINTS = (_hint_outbox, _hint_plugin_update, _hint_legacy_policy, _hint_s
                  _hint_requests, _hint_gsd, _hint_outbox_redundant)
 
 
+# ---------------------------------------------------------------- wait (watch the inbox)
+
+def _inbox_snapshot(root: Path) -> Dict[str, Tuple[int, float]]:
+    inbox = root / "science" / "inbox"
+    snap = {}  # type: Dict[str, Tuple[int, float]]
+    if inbox.is_dir():
+        for p in inbox.iterdir():
+            if p.is_file() and p.name not in (".gitkeep", "README.md", ".selftest-probe"):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                snap[p.name] = (st.st_size, st.st_mtime)
+    return snap
+
+
+def _arrivals(before: Dict[str, Tuple[int, float]], now: Dict[str, Tuple[int, float]]) -> List[str]:
+    return sorted(n for n, sig in now.items() if before.get(n) != sig)
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    """Block until Claude Science writes something to science/inbox/ (a finding or selftest.json), then wait
+    until the folder has been quiet for --settle seconds so half-written files are not picked up.
+
+    Claude Science has no API, so this watches files only. Run it in the background from Claude Code; exit 0 =
+    something arrived (JSON lists it), exit 2 = timeout with nothing new (a good moment to look at Claude
+    Science for an approval prompt or a question), exit 1 = error.
+    """
+    import time
+    root = require_project(args.project_dir)
+    interval = max(1.0, float(args.interval))
+    deadline = time.time() + max(0.0, float(args.timeout))
+    start = _inbox_snapshot(root)
+    already = sorted(n for n in start if n.endswith(".md") or n == SELFTEST_NAME)
+    if already and not args.new_only:
+        changed = already
+    else:
+        changed = []
+        while time.time() < deadline:
+            time.sleep(interval)
+            now = _inbox_snapshot(root)
+            changed = [n for n in _arrivals(start, now) if n.endswith(".md") or n == SELFTEST_NAME]
+            if changed:
+                break
+        if not changed:
+            _emit({"ok": True, "arrived": [], "timed_out": True, "waited_s": int(args.timeout),
+                   "hint": "Nothing new in science/inbox/. If Claude Science looks idle, check it for "
+                           "'Waiting for your approval' or a question; if it answered only in chat, ask it to "
+                           "write the answer as a finding in science/inbox/."})
+            return 2
+    # settle: wait until no file has changed for --settle seconds (bounded by the overall timeout + settle)
+    last = _inbox_snapshot(root)
+    quiet_since = time.time()
+    settle_deadline = max(deadline, time.time()) + float(args.settle) * 6
+    while time.time() - quiet_since < float(args.settle) and time.time() < settle_deadline:
+        time.sleep(min(interval, max(0.5, float(args.settle) / 4)))
+        now = _inbox_snapshot(root)
+        if now != last:
+            last, quiet_since = now, time.time()
+    inb = _inbox_report(root)
+    findings = [{"file": Path(f["file"]).name, "ok": f["ok"], "errors": f["errors"], **f["meta"]}
+                for f in inb["findings"]]
+    selftest = (root / "science" / "inbox" / SELFTEST_NAME).is_file()
+    nxt = []
+    if selftest:
+        nxt.append("/science-bridge:bridge verify")
+    if findings:
+        nxt.append("/science-bridge:bridge ingest")
+    _emit({"ok": True, "arrived": sorted(set(changed) | set(n for n in last if n not in start)),
+           "timed_out": False, "findings": findings, "attachments": inb["attachments"],
+           "selftest_waiting": selftest, "next": nxt})
+    return 0
+
+
 def cmd_session_hint(args: argparse.Namespace) -> int:
     try:
         start = None
@@ -1679,11 +1754,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--context", default=None, help="paths the question concerns")
     p.add_argument("--affects", default=None, help="requirement IDs, e.g. 'LBL-01, LBL-06'")
     sub.add_parser("session-hint")
+    p = sub.add_parser("wait")
+    p.add_argument("--timeout", type=float, default=3600, help="seconds to wait for something new (default 3600)")
+    p.add_argument("--interval", type=float, default=10, help="poll interval in seconds (default 10)")
+    p.add_argument("--settle", type=float, default=20, help="quiet seconds before reporting (default 20)")
+    p.add_argument("--new-only", action="store_true", help="ignore findings already waiting at start")
     args = ap.parse_args(argv)
     handlers = {"init": cmd_init, "export": cmd_export, "check": cmd_check, "status": cmd_status,
                 "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup,
                 "requests": cmd_requests, "ask": cmd_ask, "cs-setup": cmd_cs_setup, "skill-zip": cmd_skill_zip,
-                "verify": cmd_verify, "compute-check": cmd_compute_check, "outbox-clean": cmd_outbox_clean}
+                "verify": cmd_verify, "compute-check": cmd_compute_check, "outbox-clean": cmd_outbox_clean, "wait": cmd_wait}
     try:
         return handlers[args.cmd](args)
     except BridgeError as e:

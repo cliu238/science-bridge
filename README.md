@@ -57,6 +57,8 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
   - add their own questions to the queue without waiting for answers.
 - **GSD itself is never modified.** Only its extension points are used.
 
+- **No watching needed:** after a request, Claude Code watches `science/inbox/` in the background (`wait`). When it has Chrome, it also checks Claude Science for approval prompts. It ingests when the findings arrive.
+
 **Compute**
 - `compute` hosts in `policy.json`, each with `reach: claude-science` (Claude Science uses its own Compute target) or `reach: claude-code` (Claude Code runs the job).
 - `run`: Claude Code shows a proposal's run spec and asks you, then runs it (SLURM-aware, login shell, asks before submitting jobs). It commits the outputs and a `RUN.md` to `science/runs/<slug>/`.
@@ -220,6 +222,7 @@ Keep in mind:
 | Ask Claude Science something | Claude Code | `/science-bridge:bridge ask "…" --affects "REQ-01"` |
 | Have Claude Science work the queue | Claude Science | "process the open SQ requests". It also understands requests in Chinese, such as 处理待咨询问题. |
 | Give Claude Science a one-off task | Claude Science | Describe the task. It still checks the repo first and writes a finding. |
+| Wait for Claude Science to finish | nowhere | Nothing to do. After a request, Claude Code watches `science/inbox/` in the background (`wait`), checks Claude Science for approval prompts when it has Chrome, and ingests when the files arrive |
 | Bring the results into GSD | Claude Code | `/science-bridge:bridge ingest`, or `ingest --yes` to accept default routes and commit |
 | Run a compute proposal | Claude Code | `/science-bridge:bridge run science/archive/<file>.md` |
 | Check the whole setup | Claude Science, then Claude Code | "Run the science-bridge self-test", then `/science-bridge:bridge verify` |
@@ -237,6 +240,7 @@ Keep in mind:
 | `ingest [--yes]` | Route inbox findings into GSD and archive them; `--yes` accepts default routes and commits |
 | `run <finding>` | Run a compute proposal on its host, with your OK, and commit the outputs to `science/runs/<slug>/` |
 | `status` / `check` | Show what is pending, versions and the GSD wiring / validate the inbox and outbox |
+| `wait [--timeout S]` | Block until Claude Science writes to `science/inbox/`, then report what arrived (exit 0), or time out (exit 2). Claude Code runs it in the background |
 | `compute-check` | Test that Claude Code can log in to each `reach: claude-code` host |
 | `gsd-setup` | Re-install the GSD `science-context` skill and `agent_skills` entries (`setup` does this too) |
 | `export <paths>` / `outbox-clean` | Copy policy-checked files from **outside** the repo into the outbox / remove old copies of repo files |

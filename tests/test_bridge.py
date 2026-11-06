@@ -1295,3 +1295,53 @@ class PartialArchive(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitForInbox(unittest.TestCase):
+    """`wait` watches science/inbox/ because Claude Science has no API."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        run(["--project-dir", str(self.root), "init"])
+        self.inbox = self.root / "science" / "inbox"
+
+    def test_times_out_with_exit_2_when_nothing_arrives(self):
+        code, out = run(["--project-dir", str(self.root), "wait", "--timeout", "1.2", "--interval", "1",
+                         "--settle", "0.5"])
+        self.assertEqual(code, 2, out)
+        self.assertTrue(out["timed_out"])
+        self.assertEqual(out["arrived"], [])
+
+    def test_reports_a_finding_written_while_waiting(self):
+        import threading
+        import time
+
+        def write_later():
+            time.sleep(1.2)
+            (self.inbox / "2026-11-06-larynx-groups.csv").write_text("a,b\n")
+            (self.inbox / "2026-11-06-larynx-stage-groups.md").write_text(VALID.replace(
+                "inbox/2026-11-06-larynx-groups.csv", "inbox/2026-11-06-larynx-groups.csv"))
+        threading.Thread(target=write_later).start()
+        code, out = run(["--project-dir", str(self.root), "wait", "--timeout", "20", "--interval", "1",
+                         "--settle", "1"])
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["timed_out"])
+        self.assertIn("2026-11-06-larynx-stage-groups.md", out["arrived"])
+        self.assertEqual([f["file"] for f in out["findings"]], ["2026-11-06-larynx-stage-groups.md"])
+        self.assertIn("/science-bridge:bridge ingest", out["next"])
+
+    def test_returns_at_once_when_findings_already_wait_unless_new_only(self):
+        (self.inbox / "2026-11-06-larynx-stage-groups.md").write_text(VALID)
+        code, out = run(["--project-dir", str(self.root), "wait", "--timeout", "30", "--settle", "0.5"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["arrived"], ["2026-11-06-larynx-stage-groups.md"])
+        code, out = run(["--project-dir", str(self.root), "wait", "--new-only", "--timeout", "1.2",
+                         "--interval", "1", "--settle", "0.5"])
+        self.assertEqual(code, 2, out)
+
+    def test_selftest_arrival_points_to_verify(self):
+        (self.inbox / "selftest.json").write_text("{}")
+        code, out = run(["--project-dir", str(self.root), "wait", "--timeout", "5", "--settle", "0.5"])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out["selftest_waiting"])
+        self.assertEqual(out["next"], ["/science-bridge:bridge verify"])
