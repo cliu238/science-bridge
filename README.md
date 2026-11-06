@@ -283,6 +283,7 @@ The session-start hint tells you when the installed plugin is older than its sou
 | Claude Science can't reach your cluster | Its sandbox can't use `~/.ssh`, and its Compute hosts can't do interactive or multi-factor login. Use `reach: claude-code` |
 | `sinfo: command not found` over ssh | A non-interactive shell has no SLURM or `module` on PATH. `run` uses a login shell (`bash -l`) |
 | New plugin behaviour doesn't show up | Run `claude plugin update …` (see Upgrading) and restart Claude Code |
+| `Unknown command: /science-bridge:bridge` | That Claude Code session started **before** the plugin was installed or updated, and plugins load only at session start. Open a new session in the project (`/exit`, then `claude`). Check with `claude plugin list` that science-bridge is enabled |
 | Claude Code lists `anthropic-skills:science-findings` | The published Claude Science skill syncs into Claude Code. This is harmless, and its description points Claude Code to `/science-bridge:bridge` |
 
 ## Guarantees and limits
