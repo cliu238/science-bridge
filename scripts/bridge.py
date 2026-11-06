@@ -24,9 +24,15 @@ Commands:
                                     "claude-code"; exit 1 if one is unreachable
   export PATH [PATH ...]            copy approved files into science/outbox/ and record them in
                                     MANIFEST.json; refuses anything policy.json "export" does not
-                                    allow
+                                    allow. A file outside the repo needs an absolute
+                                    export.allowed_sources pattern; under access "repo-readonly"
+                                    repo files are refused (Claude Science reads them in place)
+  outbox-clean [--yes]              repo-readonly only: list the outbox copies of repo files
+                                    (exported before repo-readonly); with --yes delete them from
+                                    science/outbox/ and MANIFEST.json
   check                             verify outbox integrity against MANIFEST.json and validate
-                                    inbox findings; exit 1 on any problem
+                                    inbox findings; exit 1 on any problem (old copies listed in
+                                    outbox.redundant are not a problem)
   status                            versions, policy summary, pending inbox findings with
                                     validation results, self-test state (JSON)
   archive FILE --route R --ref TXT  move a routed finding (and its inbox attachments) to
@@ -123,6 +129,8 @@ PRIVACY_LEVELS = ("phi", "confidential", "public")
 ACCESS_MODES = ("repo-readonly", "science-only")
 ROUTES = ("note", "todo", "seed", "manual", "rejected")
 OUTBOX_RESERVED = {"MANIFEST.json", ".gitkeep"}
+EXPORT_REPO_READONLY = ("%s: Claude Science reads repo files directly in repo-readonly mode; export is only for "
+                        "files outside the repo")
 SELFTEST_NAME = "selftest.json"
 SELFTEST_LATEST = "selftest-latest.json"
 SELFTEST_FORMAT = "science-bridge-selftest/v1"
@@ -577,6 +585,16 @@ def cmd_init(args: argparse.Namespace) -> int:
     if readme_backup:
         next_steps.insert(2, "Your old science/README.md is kept at %s; move anything still needed into the "
                              "Project brief, then delete it." % readme_backup)
+    redundant = []  # type: List[Dict[str, str]]
+    if policy_ok:
+        try:
+            access = load_policy(root)["access"]
+            redundant = _outbox_report(root, access)["redundant"] if access == "repo-readonly" else []
+        except (BridgeError, OSError):
+            redundant = []
+    if redundant:
+        next_steps.append("science/outbox has %d old copies of repo files; Claude Science now reads the repo "
+                          "directly. Run /science-bridge:bridge outbox-clean to remove them." % len(redundant))
     out = {
         "ok": policy_ok,
         "project": str(root),
@@ -588,6 +606,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if readme_backup:
         out["readme_backup"] = readme_backup
     out["gsd"] = gsd if gsd is not None else "skipped (no .planning/config.json or --no-gsd)"
+    out["outbox_redundant"] = redundant
     out["next_steps"] = next_steps
     _emit(out)
     return 0 if policy_ok else 1
@@ -656,6 +675,9 @@ def cmd_cs_setup(args: argparse.Namespace) -> int:
         "Open a NEW session in the project (a session loads skills and instructions when it starts) and say "
         "\"Run the science-bridge self-test\".",
         "Back in Claude Code, run /science-bridge:bridge verify; it checks the self-test result and says what to fix.",
+        "While Claude Science works it may stop at \"Waiting for your approval\" (package installs, network domains, "
+        "compute). If a task shows no progress for ~2 minutes, look; approve prompts that fit the task with scope "
+        "\"This project\".",
     ]
     warnings = []
     if policy["_legacy"]:
@@ -1169,28 +1191,70 @@ def cmd_gsd_setup(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------- export
 
-def _export_errors(root: Path, src: Path, rel: str, policy: Dict[str, Any]) -> List[str]:
-    errors = []  # type: List[str]
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _abs_patterns(patterns: List[Any]) -> List[str]:
+    """The absolute export.allowed_sources patterns after ~ expansion, each also with its literal
+    directory prefix resolved (so /tmp/x/*.csv matches the real path /private/tmp/x/... on macOS)."""
+    out = []  # type: List[str]
+    for pattern in patterns:
+        p = os.path.expanduser(str(pattern))
+        if not os.path.isabs(p):
+            continue
+        out.append(p)
+        parts = Path(p).parts
+        i = next((k for k, part in enumerate(parts) if any(c in part for c in "*?[")), len(parts))
+        try:
+            out.append(str(Path(*parts[:i]).resolve().joinpath(*parts[i:])))
+        except (OSError, RuntimeError):
+            pass
+    return out
+
+
+def _export_errors(root: Path, src: Path, rel: Optional[str], policy: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Check one export source. REL is its repo-relative path as named, or None when it is named outside
+    the project. Returns (the manifest `source`: REL, or the absolute real path outside the repo; errors)."""
     export = policy["export"]
     try:
         real = src.resolve()
-        real.relative_to(root)
-    except (OSError, ValueError):
-        return ["%s: resolves outside the project" % rel]
+    except (OSError, RuntimeError):
+        return rel or str(src), ["%s: cannot be resolved" % (rel or src)]
+    if rel is None:
+        label = str(real)
+        if _within(real, root):
+            return label, ["%s: resolves into the project; name the repo path instead" % src]
+        if not any(fnmatch.fnmatchcase(label, p) for p in _abs_patterns(export["allowed_sources"])):
+            return label, ["%s: outside the project %s and matches no absolute export.allowed_sources pattern "
+                           "(e.g. \"~/shared/*.csv\")" % (label, root)]
+    else:
+        label = rel
+        if not _within(real, root):
+            return rel, ["%s: resolves outside the project" % rel]
+        if policy["access"] == "repo-readonly":
+            return rel, [EXPORT_REPO_READONLY % rel]
     if not real.is_file():
-        return ["%s: not a regular file" % rel]
-    if any(fnmatch.fnmatchcase(rel, p) for p in policy.get("do_not_read", [])):
-        errors.append("%s: matches do_not_read in policy.json" % rel)
-    if (root / "science") in real.parents:
-        errors.append("%s: files already under science/ cannot be exported" % rel)
+        return label, ["%s: not a regular file" % label]
+    errors = []  # type: List[str]
+    if rel is not None:
+        named = {rel, real.relative_to(root).as_posix()}  # a symlink inside the repo is checked at both ends
+        if any(fnmatch.fnmatchcase(r, p) for r in named for p in policy.get("do_not_read", [])):
+            errors.append("%s: matches do_not_read in policy.json" % rel)
+        if (root / "science") in real.parents:
+            errors.append("%s: files already under science/ cannot be exported" % rel)
+        patterns = export["allowed_sources"]
+        if patterns and not any(fnmatch.fnmatchcase(rel, p) for p in patterns):
+            errors.append("%s: does not match any export.allowed_sources pattern" % rel)
     exts = [e.lower() for e in export["allowed_extensions"]]
     if exts and real.suffix.lower() not in exts:
-        errors.append("%s: extension %r is not in export.allowed_extensions" % (rel, real.suffix))
+        errors.append("%s: extension %r is not in export.allowed_extensions" % (label, real.suffix))
     if real.stat().st_size > float(export["max_file_mb"]) * 1024 * 1024:
-        errors.append("%s: larger than export.max_file_mb=%s" % (rel, export["max_file_mb"]))
-    patterns = export["allowed_sources"]
-    if patterns and not any(fnmatch.fnmatchcase(rel, p) for p in patterns):
-        errors.append("%s: does not match any export.allowed_sources pattern" % rel)
+        errors.append("%s: larger than export.max_file_mb=%s" % (label, export["max_file_mb"]))
     cmd = export.get("check_command")
     if cmd and not errors:
         argv = [tok.replace("{file}", str(real)) for tok in shlex.split(cmd)]
@@ -1199,12 +1263,12 @@ def _export_errors(root: Path, src: Path, rel: str, policy: Dict[str, Any]) -> L
         try:
             proc = subprocess.run(argv, cwd=str(root), capture_output=True, text=True, timeout=300)
         except (OSError, subprocess.TimeoutExpired) as e:
-            errors.append("%s: check_command could not run: %s" % (rel, e))
+            errors.append("%s: check_command could not run: %s" % (label, e))
         else:
             if proc.returncode != 0:
                 tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
-                errors.append("%s: check_command refused it (exit %d): %s" % (rel, proc.returncode, " | ".join(tail)))
-    return errors
+                errors.append("%s: check_command refused it (exit %d): %s" % (label, proc.returncode, " | ".join(tail)))
+    return label, errors
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -1218,30 +1282,34 @@ def cmd_export(args: argparse.Namespace) -> int:
     all_errors = []  # type: List[str]
     seen = set()
     for raw in args.paths:
-        src = Path(raw)
+        src = Path(raw).expanduser()
         src = src if src.is_absolute() else (root / src)
         # Resolve directory symlinks (e.g. /var -> /private/var on macOS) but keep the final
         # component as written, so allowed_sources matches the path the user named; the
         # escape check in _export_errors resolves the full path separately.
         try:
-            rel = (src.parent.resolve() / src.name).relative_to(root).as_posix()
-        except (OSError, ValueError):
-            all_errors.append("%s: outside the project %s" % (raw, root))
+            named = src.parent.resolve() / src.name
+        except (OSError, RuntimeError) as e:
+            all_errors.append("%s: cannot be resolved: %s" % (raw, e))
             continue
-        errs = _export_errors(root, src, rel, policy)
+        rel = named.relative_to(root).as_posix() if _within(named, root) else None
+        source, errs = _export_errors(root, src, rel, policy)
         name = src.name
         if name in OUTBOX_RESERVED:
-            errs.append("%s: reserved name" % rel)
+            errs.append("%s: reserved name" % source)
         if name in seen:
-            errs.append("%s: two files named %r in one export" % (rel, name))
+            errs.append("%s: two files named %r in one export" % (source, name))
         seen.add(name)
         existing = by_name.get(name)
-        if existing and existing["source"] != rel:
-            errs.append("%s: outbox already has %r from %s; rename one of them" % (rel, name, existing["source"]))
+        if existing and existing["source"] != source:
+            old_copy = policy["access"] == "repo-readonly" and not os.path.isabs(existing["source"])
+            errs.append("%s: outbox already has %r from %s; %s" % (
+                source, name, existing["source"],
+                "it is an old copy of a repo file, run outbox-clean to remove it" if old_copy else "rename one of them"))
         if errs:
             all_errors.extend(errs)
         else:
-            plan.append((src.resolve(), rel, name))
+            plan.append((src.resolve(), source, name))
 
     if all_errors:
         _emit({"ok": False, "exported": [], "errors": all_errors,
@@ -1249,16 +1317,16 @@ def cmd_export(args: argparse.Namespace) -> int:
         return 1
 
     exported = []
-    for real, rel, name in plan:
+    for real, source, name in plan:
         digest = _sha256(real)
         entry = by_name.get(name)
         if entry and entry["sha256"] == digest and (outbox / name).is_file() and _sha256(outbox / name) == digest:
-            exported.append({"name": name, "source": rel, "status": "unchanged"})
+            exported.append({"name": name, "source": source, "status": "unchanged"})
             continue
         shutil.copyfile(str(real), str(outbox / name))
-        new = {"name": name, "sha256": digest, "bytes": real.stat().st_size, "source": rel, "exported_at": _now()}
+        new = {"name": name, "sha256": digest, "bytes": real.stat().st_size, "source": source, "exported_at": _now()}
         by_name[name] = new
-        exported.append({"name": name, "source": rel, "status": "updated" if entry else "added"})
+        exported.append({"name": name, "source": source, "status": "updated" if entry else "added"})
     manifest["files"] = sorted(by_name.values(), key=lambda f: f["name"])
     manifest["policy_version"] = policy.get("policy_version")
     manifest["privacy"] = policy["privacy"]
@@ -1269,13 +1337,15 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------- check / status
 
-def _outbox_report(root: Path) -> Dict[str, Any]:
+def _outbox_report(root: Path, access: Optional[str] = None) -> Dict[str, Any]:
+    """Outbox integrity. Under ACCESS "repo-readonly", entries copied from repo files (a relative manifest
+    `source`) are listed in `redundant`, not checked for staleness: Claude Science reads those files in place."""
     outbox = root / "science" / "outbox"
     violations = []  # type: List[str]
     try:
         manifest = load_manifest(root)
     except BridgeError as e:
-        return {"violations": [str(e)], "files": 0}
+        return {"violations": [str(e)], "stale": [], "redundant": [], "files": 0}
     listed = {f["name"]: f for f in manifest.get("files", [])}
     present = set()
     if outbox.is_dir():
@@ -1292,13 +1362,24 @@ def _outbox_report(root: Path) -> Dict[str, Any]:
             elif _sha256(p) != entry.get("sha256"):
                 violations.append("outbox/%s: content differs from MANIFEST.json sha256" % p.name)
     stale = []  # type: List[str]
+    redundant = []  # type: List[Dict[str, str]]
     for name, entry in listed.items():
         if name not in present:
             violations.append("outbox/%s: listed in MANIFEST.json but missing" % name)
-        src = root / entry.get("source", "")
-        if entry.get("source") and src.is_file() and _sha256(src) != entry.get("sha256"):
-            stale.append("outbox/%s: %s changed since export; re-run export to refresh" % (name, entry["source"]))
-    return {"violations": violations, "stale": stale, "files": len(present)}
+        source = entry.get("source")
+        if not isinstance(source, str) or not source:
+            continue
+        if access == "repo-readonly" and not os.path.isabs(source):
+            redundant.append({"name": name, "source": source})
+            continue
+        src = Path(source) if os.path.isabs(source) else root / source
+        try:
+            changed = src.is_file() and _sha256(src) != entry.get("sha256")
+        except OSError:  # e.g. an outside source that is no longer readable
+            changed = False
+        if changed:
+            stale.append("outbox/%s: %s changed since export; re-run export to refresh" % (name, source))
+    return {"violations": violations, "stale": stale, "redundant": redundant, "files": len(present)}
 
 
 def _inbox_report(root: Path) -> Dict[str, Any]:
@@ -1317,8 +1398,8 @@ def _inbox_report(root: Path) -> Dict[str, Any]:
 
 def cmd_check(args: argparse.Namespace) -> int:
     root = require_project(args.project_dir)
-    load_policy(root)
-    out = _outbox_report(root)
+    policy = load_policy(root)
+    out = _outbox_report(root, policy["access"])
     inb = _inbox_report(root)
     invalid = [f for f in inb["findings"] if not f["ok"]]
     ok = not out["violations"] and not invalid
@@ -1331,7 +1412,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     root = require_project(args.project_dir)
     policy = load_policy(root)
-    out = _outbox_report(root)
+    out = _outbox_report(root, policy["access"])
     inb = _inbox_report(root)
     _emit({
         "project": str(root),
@@ -1353,6 +1434,32 @@ def cmd_status(args: argparse.Namespace) -> int:
         "selftest_pending": (root / "science" / "inbox" / SELFTEST_NAME).is_file(),
         "last_selftest": _last_selftest(root),
     })
+    return 0
+
+
+def cmd_outbox_clean(args: argparse.Namespace) -> int:
+    root = require_project(args.project_dir)
+    policy = load_policy(root)
+    if policy["access"] != "repo-readonly":
+        raise BridgeError("outbox-clean only applies to access \"repo-readonly\" (this project: %s); under "
+                          "science-only the outbox copies are what Claude Science reads" % policy["access"])
+    manifest = load_manifest(root)
+    redundant = _outbox_report(root, policy["access"])["redundant"]
+    if not args.yes:
+        _emit({"ok": True, "would_remove": redundant,
+               "note": "dry run; run outbox-clean --yes to delete these copies from science/outbox/ and MANIFEST.json"
+               if redundant else "nothing to remove"})
+        return 0
+    outbox = root / "science" / "outbox"
+    names = set(r["name"] for r in redundant)
+    for name in sorted(names):
+        p = outbox / name
+        if Path(name).name == name and name not in OUTBOX_RESERVED and (p.is_file() or p.is_symlink()):
+            p.unlink()
+    if names:
+        manifest["files"] = [f for f in manifest.get("files", []) if f.get("name") not in names]
+        save_manifest(root, manifest)
+    _emit({"ok": True, "removed": redundant, "kept": [f.get("name") for f in manifest.get("files", [])]})
     return 0
 
 
@@ -1488,8 +1595,19 @@ def _hint_gsd(root: Path) -> Optional[str]:
     return None
 
 
+def _hint_outbox_redundant(root: Path) -> Optional[str]:
+    access = load_policy(root)["access"]
+    if access != "repo-readonly":
+        return None
+    n = len(_outbox_report(root, access)["redundant"])
+    if not n:
+        return None
+    return ("[science-bridge] science/outbox has %d old copies of repo files; Claude Science now reads the repo "
+            "directly. Run /science-bridge:bridge outbox-clean to remove them." % n)
+
+
 SESSION_HINTS = (_hint_outbox, _hint_plugin_update, _hint_legacy_policy, _hint_selftest, _hint_findings,
-                 _hint_requests, _hint_gsd)
+                 _hint_requests, _hint_gsd, _hint_outbox_redundant)
 
 
 def cmd_session_hint(args: argparse.Namespace) -> int:
@@ -1538,6 +1656,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--agents", default=None, help="comma-separated GSD agent types (default: researchers + planners)")
     p = sub.add_parser("export")
     p.add_argument("paths", nargs="+")
+    p = sub.add_parser("outbox-clean")
+    p.add_argument("--yes", action="store_true", help="delete the copies (default: dry run, list them)")
     sub.add_parser("check")
     sub.add_parser("status")
     p = sub.add_parser("archive")
@@ -1556,7 +1676,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     handlers = {"init": cmd_init, "export": cmd_export, "check": cmd_check, "status": cmd_status,
                 "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup,
                 "requests": cmd_requests, "ask": cmd_ask, "cs-setup": cmd_cs_setup, "skill-zip": cmd_skill_zip,
-                "verify": cmd_verify, "compute-check": cmd_compute_check}
+                "verify": cmd_verify, "compute-check": cmd_compute_check, "outbox-clean": cmd_outbox_clean}
     try:
         return handlers[args.cmd](args)
     except BridgeError as e:

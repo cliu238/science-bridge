@@ -9,7 +9,8 @@ This document defines the shared handoff format between a Claude Code (+ GSD) pr
 ├── science/
 │   ├── README.md        map of the project for Claude Science (managed block + project brief)
 │   ├── policy.json      access mode, do_not_read, compute hosts, skill_min_version, export rules
-│   ├── outbox/          optional: files from OUTSIDE the repo, written only by `bridge.py export`
+│   ├── outbox/          optional: files from OUTSIDE the repo (science-only: also repo files),
+│   │                    written only by `bridge.py export`
 │   │   └── MANIFEST.json  every exported file: name, sha256, bytes, source, exported_at
 │   ├── inbox/           Claude Science → project. One markdown finding per file,
 │   │                    plus selftest.json while a self-test waits for `bridge.py verify`
@@ -58,7 +59,9 @@ Policies older than v3 have the export keys at the top level. `bridge.py init` u
 
 ## Outbox rules
 
-The outbox is mainly for files that live outside the repo. In `repo-readonly` mode Claude Science reads repo files where they are.
+The outbox holds copies of files from **outside** the repo. `bridge.py export` takes such a file only if its real path matches an absolute `export.allowed_sources` pattern, such as `"~/shared/ajcc/*.docx"`. Its manifest `source` is then that absolute path.
+- **`repo-readonly`:** Claude Science reads repo files where they are, so `export` refuses them. Older copies of repo files (a repo-relative `source`) are reported as `redundant` and removed with `bridge.py outbox-clean`. Until then, read the repo file, not its outbox copy.
+- **`science-only`:** `export` also copies repo files, matched by relative patterns, and the outbox is all Claude Science may read.
 - Every file in `outbox/` (except `MANIFEST.json` and `.gitkeep`) must be listed in `MANIFEST.json` with a matching sha256. Any other file is a violation, and `bridge.py check` fails on it.
 - Files enter the outbox only through `bridge.py export`, which applies `policy.json`.
 - Claude Science treats the outbox as read-only.

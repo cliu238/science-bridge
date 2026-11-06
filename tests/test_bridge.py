@@ -65,7 +65,7 @@ def run(argv):
 
 V2_POLICY = {
     "policy_version": 2,
-    "access": "repo-readonly",
+    "access": "science-only",  # its tests export repo files, which only science-only allows
     "do_not_read": ["prereg/*"],
     "privacy": "phi",
     "allowed_sources": ["docs/*.md"],
@@ -159,6 +159,7 @@ class BridgeFlow(unittest.TestCase):
         code, out = run(["--project-dir", str(self.root), "init"])
         self.assertEqual(code, 0, out)
         self.sci = self.root / "science"
+        self.set_policy(access="science-only")  # these tests export repo files; repo-readonly refuses that
 
     def set_policy(self, **overrides):
         policy = json.loads((self.sci / "policy.json").read_text())
@@ -411,11 +412,160 @@ class RequestQueueAndAccess(unittest.TestCase):
         (self.root / "prereg").mkdir()
         (self.root / "prereg" / "sealed.md").write_text("fold ids")
         policy = json.loads((self.root / "science" / "policy.json").read_text())
-        policy.update(privacy="public", do_not_read=["prereg/sealed*"])
+        policy.update(privacy="public", do_not_read=["prereg/sealed*"], access="science-only")
         (self.root / "science" / "policy.json").write_text(json.dumps(policy))
         code, out = run(["--project-dir", str(self.root), "export", str(self.root / "prereg" / "sealed.md")])
         self.assertEqual(code, 1)
         self.assertTrue(any("do_not_read" in e for e in out["errors"]))
+        os.symlink(str(self.root / "prereg" / "sealed.md"), str(self.root / "alias.md"))
+        code, out = run(["--project-dir", str(self.root), "export", str(self.root / "alias.md")])
+        self.assertEqual(code, 1, "a symlink to a do_not_read file is refused too")
+        self.assertTrue(any("do_not_read" in e for e in out["errors"]))
+
+
+class OutboxModes(unittest.TestCase):
+    """Outside-repo exports, the repo-readonly refusal, redundant old copies and outbox-clean."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "guide.md").write_text("guide\n")
+        (self.root / "docs" / "notes.md").write_text("notes\n")
+        self.ext_named = Path(tempfile.mkdtemp())  # as named; /var/... -> /private/var/... on macOS
+        self.ext = self.ext_named.resolve()
+        (self.ext / "dictionary.csv").write_text("col,meaning\n")
+        (self.ext / "other.txt").write_text("x\n")
+        secret_dir = Path(tempfile.mkdtemp()).resolve()
+        (secret_dir / "secret.csv").write_text("not allowed\n")
+        os.symlink(str(secret_dir / "secret.csv"), str(self.ext / "link.csv"))
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(code, 0, out)
+        self.sci = self.root / "science"
+        self.policy_path = self.sci / "policy.json"
+
+    def set_policy(self, **overrides):
+        policy = read_json(self.policy_path)
+        for key, value in overrides.items():
+            (policy["export"] if key in bridge.EXPORT_KEYS else policy)[key] = value
+        write_json(self.policy_path, policy)
+
+    def cli(self, *argv):
+        return run(["--project-dir", str(self.root)] + [str(a) for a in argv])
+
+    def manifest_names(self):
+        return [f["name"] for f in read_json(self.sci / "outbox" / "MANIFEST.json")["files"]]
+
+    def test_outside_export_needs_an_absolute_pattern(self):
+        for patterns in ([], ["docs/*.md", "*.csv"]):
+            self.set_policy(allowed_sources=patterns)
+            code, out = self.cli("export", self.ext / "dictionary.csv")
+            self.assertEqual(code, 1, patterns)
+            self.assertIn("matches no absolute export.allowed_sources pattern", out["errors"][0])
+        self.assertEqual(self.manifest_names(), [])
+
+        self.set_policy(allowed_sources=[str(self.ext_named) + "/*.csv"])
+        code, out = self.cli("export", self.ext_named / "dictionary.csv")
+        self.assertEqual(code, 0, out)
+        real = str(self.ext / "dictionary.csv")
+        self.assertEqual(out["exported"], [{"name": "dictionary.csv", "source": real, "status": "added"}])
+        entry = read_json(self.sci / "outbox" / "MANIFEST.json")["files"][0]
+        self.assertEqual(entry["source"], real)
+        self.assertTrue((self.sci / "outbox" / "dictionary.csv").is_file())
+        code, out = self.cli("export", self.ext / "dictionary.csv")
+        self.assertEqual(out["exported"][0]["status"], "unchanged")
+
+        code, out = self.cli("export", self.ext / "other.txt")
+        self.assertEqual(code, 1, "an outside file that matches no absolute pattern is refused")
+        self.assertIn("matches no absolute", out["errors"][0])
+        code, out = self.cli("export", self.ext / "link.csv")
+        self.assertEqual(code, 1, "patterns match the real path, so a symlink can't smuggle a file in")
+        self.assertIn("secret.csv", out["errors"][0])
+        self.set_policy(allowed_sources=[str(self.ext) + "/*"], allowed_extensions=[".csv"])
+        code, out = self.cli("export", self.ext / "other.txt")
+        self.assertEqual(code, 1, "other checks still apply outside the repo")
+        self.assertIn("allowed_extensions", out["errors"][0])
+
+        (self.ext / "dictionary.csv").write_text("col,meaning,changed\n")
+        code, out = self.cli("check")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["outbox"]["stale"],
+                         ["outbox/dictionary.csv: %s changed since export; re-run export to refresh" % real])
+        self.assertEqual(out["outbox"]["redundant"], [])
+
+    def test_home_relative_pattern(self):
+        saved = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.ext.parent)
+        try:
+            self.set_policy(allowed_sources=["~/%s/*.csv" % self.ext.name])
+            code, out = self.cli("export", "~/%s/dictionary.csv" % self.ext.name)
+        finally:
+            if saved is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["exported"][0]["source"], str(self.ext / "dictionary.csv"))
+
+    def test_repo_readonly_refuses_repo_files(self):
+        self.set_policy(privacy="public")
+        for path in (self.root / "docs" / "guide.md", "docs/guide.md"):
+            code, out = self.cli("export", path)
+            self.assertEqual(code, 1, path)
+            self.assertEqual(out["errors"], ["docs/guide.md: Claude Science reads repo files directly in "
+                                             "repo-readonly mode; export is only for files outside the repo"])
+        self.assertEqual(self.manifest_names(), [])
+        self.set_policy(access="science-only")
+        code, out = self.cli("export", "docs/guide.md")
+        self.assertEqual(code, 0, "science-only still exports repo files")
+        self.assertEqual(out["exported"][0]["source"], "docs/guide.md")
+
+    def test_redundant_copies_and_outbox_clean(self):
+        self.set_policy(access="science-only", privacy="public")
+        code, out = self.cli("export", "docs/guide.md", "docs/notes.md")  # made before the switch
+        self.assertEqual(code, 0, out)
+        self.set_policy(access="repo-readonly", allowed_sources=[str(self.ext) + "/*.csv"])
+        code, out = self.cli("export", self.ext / "dictionary.csv")
+        self.assertEqual(code, 0, out)
+        (self.root / "docs" / "guide.md").write_text("guide, edited\n")
+        old = [{"name": "guide.md", "source": "docs/guide.md"}, {"name": "notes.md", "source": "docs/notes.md"}]
+
+        code, out = self.cli("check")
+        self.assertEqual(code, 0, "redundant copies are not a problem")
+        self.assertEqual((out["outbox"]["redundant"], out["outbox"]["stale"]), (old, []))
+        code, out = self.cli("status")
+        self.assertEqual(out["outbox"]["redundant"], old)
+        code, out = self.cli("init")
+        self.assertEqual(out["outbox_redundant"], old)
+        self.assertIn("outbox-clean", out["next_steps"][-1])
+
+        code, out = self.cli("outbox-clean")
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["ok"], out["would_remove"]), (True, old))
+        self.assertEqual(self.manifest_names(), ["dictionary.csv", "guide.md", "notes.md"], "dry run changes nothing")
+        self.assertTrue((self.sci / "outbox" / "guide.md").is_file())
+
+        (self.sci / "outbox" / "notes.md").unlink()
+        code, out = self.cli("check")
+        self.assertEqual(code, 1)
+        self.assertIn("outbox/notes.md: listed in MANIFEST.json but missing", out["outbox"]["violations"])
+        code, out = self.cli("outbox-clean", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["removed"], out["kept"]), (old, ["dictionary.csv"]))
+        self.assertEqual(self.manifest_names(), ["dictionary.csv"])
+        self.assertEqual(sorted(p.name for p in (self.sci / "outbox").iterdir()), ["MANIFEST.json", "dictionary.csv"])
+        code, out = self.cli("check")
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["outbox"]["violations"], out["outbox"]["redundant"]), ([], []))
+        code, out = self.cli("outbox-clean")
+        self.assertEqual(out["would_remove"], [])
+        code, out = self.cli("init")
+        self.assertEqual(out["outbox_redundant"], [])
+
+    def test_outbox_clean_needs_repo_readonly(self):
+        self.set_policy(access="science-only")
+        code, out = self.cli("outbox-clean", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn('only applies to access "repo-readonly"', out["error"])
 
 
 class SessionHint(unittest.TestCase):
@@ -456,6 +606,25 @@ class SessionHint(unittest.TestCase):
         out = self.hint(root / "src")
         self.assertIn("1 Claude Science finding(s) waiting", out)
         self.assertIn("WARNING: science/outbox", out)
+
+    def test_redundant_outbox_hint(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "docs").mkdir()
+        (root / "docs" / "guide.md").write_text("guide\n")
+        run(["--project-dir", str(root), "init"])
+        confirm_skill(root)
+        policy_path = root / "science" / "policy.json"
+        policy = read_json(policy_path)
+        write_json(policy_path, {**policy, "access": "science-only"})
+        code, out = run(["--project-dir", str(root), "export", "docs/guide.md"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.hint(root), "", "under science-only the copy is not redundant")
+        write_json(policy_path, policy)
+        self.assertEqual(self.hint(root).strip(),
+                         "[science-bridge] science/outbox has 1 old copies of repo files; Claude Science now reads the "
+                         "repo directly. Run /science-bridge:bridge outbox-clean to remove them.")
+        run(["--project-dir", str(root), "outbox-clean", "--yes"])
+        self.assertEqual(self.hint(root), "")
 
     def test_reports_missing_gsd_skill_in_gsd_project(self):
         root = Path(tempfile.mkdtemp())

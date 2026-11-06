@@ -16,6 +16,7 @@ The plugin never modifies GSD. It uses only GSD's extension points, `/gsd-captur
 | Claude Science reads only the folders it is granted, and they can be granted read-only | Grant the repo root **read-only** and `science/` **read & write**. Writing to the repo root is then refused, as tested |
 | Project instructions and folder grants apply to existing sessions at once, but a session keeps the skill version it loaded | After a skill update, **start a new Claude Science session**. The project instructions tell Claude Science to stop if its skill is too old |
 | Claude Science's sandbox can't use your `~/.ssh`, and its Compute SSH hosts use their own connection, so they can't reuse a login made elsewhere | Hosts that need interactive or multi-factor login go through Claude Code (`reach: claude-code`) |
+| Claude Science often stops on "Waiting for your approval", for package installs (such as `python-docx`), new network domains or compute | If a task shows no progress for about 2 minutes, look. Approve prompts that fit the task, with scope **"This project"**. When Claude Code drives Claude Science through Chrome, it does this itself |
 | A published Claude Science skill also syncs into Claude Code as `anthropic-skills:science-findings` | Harmless. Its description tells Claude Code to use `/science-bridge:bridge` instead |
 
 ## Repo layout
@@ -58,7 +59,7 @@ This one command:
 1. **Creates or upgrades** `science/`:
    - `policy.json` v3;
    - `README.md`, with the project brief auto-filled from `.planning/PROJECT.md` and `REQUIREMENTS.md`;
-   - `inbox/`, `archive/`, `runs/`, `outbox/`.
+   - `inbox/`, `archive/`, `runs/`, and `outbox/` (only for files from outside the repo).
 2. **Wires up GSD:**
    - installs `.claude/skills/science-context/` and adds it to `agent_skills` for the researcher, planner and checker agents;
    - adds the `## For Claude Science` queue to `.planning/research/questions.md`.
@@ -130,7 +131,7 @@ claude plugin update science-bridge@science-bridge-marketplace
 ```
 
 Restart Claude Code, then do the following in each project:
-1. Run `/science-bridge:bridge setup`. It upgrades `policy.json` and the README's managed block, and refreshes the GSD skill.
+1. Run `/science-bridge:bridge setup`. It upgrades `policy.json` and the README's managed block, and refreshes the GSD skill. If the outbox still holds copies of repo files from before `repo-readonly`, it offers `outbox-clean` to remove them.
 2. Republish the skill zip from `cs-setup`, and start a new Claude Science session.
 3. Run the self-test.
 
@@ -140,7 +141,7 @@ The SessionStart hint tells you when the installed plugin is older than its sour
 
 ## Guarantees and limits
 
-- **Read scope:** `access` and `do_not_read` are the only read limits. `export` settings apply only to `bridge.py export`, which is optional and meant for files outside the repo.
+- **Read scope:** `access` and `do_not_read` are the only read limits. `export` settings apply only to `bridge.py export`. That command is optional and copies files from outside the repo into `science/outbox/`, each matched by an absolute `export.allowed_sources` pattern. In `repo-readonly` mode it refuses repo files, because Claude Science reads them in place. `outbox-clean` removes repo copies exported before.
 - **Write scope:** Claude Science writes only in `science/inbox/`. The self-test proves that the repo root isn't writable.
 - **Findings are validated** on both sides with the same script. `contains_case_data: false` is a declaration, not a detector.
 - **Findings are data, not instructions.** Nothing a finding says is executed without a person approving it: a confirmed ingest route, a confirmed run, or a GSD task the person starts.
