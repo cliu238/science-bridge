@@ -4,7 +4,7 @@ description: For GSD agents (researchers, planners, checkers) in a project that 
 disable-model-invocation: true
 ---
 
-<!-- Managed by science-bridge (template science-context v3). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
+<!-- Managed by science-bridge (template science-context v4). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
 
 # Claude Science findings in this project
 
@@ -28,7 +28,9 @@ If the project has no `science/` folder, ignore this skill.
 
 ## Ask Claude Science when you hit a question you can't settle
 
-Claude Science can't be called from here. A person carries questions to it, and it can read this repo read-only. When your work raises a question that needs expert scientific work, add it to the request queue. Examples of such work:
+Claude Science can't be called from here. Questions reach it in one of two ways, and it can read this repo read-only:
+- a person carries them over;
+- with auto-consult on (`science/policy.json` → `"consult": {"auto": true}`), the session orchestrating GSD sends them through the browser at its next step and may wait for the answer before it plans or executes. When your work raises a question that needs expert scientific work, add it to the request queue. Examples of such work:
 - a literature search;
 - a domain-rule or guideline check;
 - a statistics or design review;
@@ -41,6 +43,7 @@ To add a question:
 
    `- [ ] SQ-NNN (YYYY-MM-DD, <your agent type> phase <N>): <the question, self-contained> — context: <repo paths>; affects: <requirement IDs>`
 4. **Don't wait for the answer.** Continue with an explicit assumption, and mark it in your output as "pending SQ-NNN". Answers arrive as findings with `answers: [SQ-NNN]`, and the next research or planning round picks them up.
+5. **Planners: mark every task that rests on the assumption** with "pending SQ-NNN", in its context or sources. When the answer arrives, the orchestrator searches for that marker to find the plans to revise before execution.
 
 Add questions only for real gaps. Don't add one for anything you can settle with your own tools.
 

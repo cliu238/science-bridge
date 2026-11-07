@@ -1,7 +1,7 @@
 ---
 name: bridge
-description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up or upgrade a science/ handoff folder, prepare the one-time Claude Science setup, verify Claude Science's self-test, queue a question for Claude Science, route findings from science/inbox/ into GSD planning, or run a compute job Claude Science proposed. Triggers include "science inbox", "Claude Science findings", "set up Claude Science", "self-test", "处理 Claude Science 的结论", "给 Claude Science 提问", "science-bridge".
-argument-hint: "[setup | cs-setup | verify | ask <question> | wait | requests | ingest [--yes] | run <finding> | status | check | gsd-setup | export <paths…> | outbox-clean [--yes]]"
+description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up or upgrade a science/ handoff folder, prepare the one-time Claude Science setup, verify Claude Science's self-test, queue a question for Claude Science, route findings from science/inbox/ into GSD planning, run a compute job Claude Science proposed, or have Claude Science consulted automatically while GSD (including /gsd-autonomous) works, and whenever a "[science-bridge auto-consult]" reminder appears. Triggers include "science inbox", "Claude Science findings", "set up Claude Science", "self-test", "auto-consult", "处理 Claude Science 的结论", "给 Claude Science 提问", "自动咨询 Claude Science", "science-bridge".
+argument-hint: "[setup | cs-setup | verify | ask <question> | wait | requests | ingest [--yes] | consult [on|off|status] | run <finding> | status | check | gsd-setup | export <paths…> | outbox-clean [--yes]]"
 ---
 
 # science-bridge: Claude Code side
@@ -11,6 +11,7 @@ Claude Science is a separate app that no other program can drive. The two sides 
 - **Claude Code routes** those findings into GSD (`.planning/`) and archives them in `science/archive/`.
 - **Questions** for Claude Science queue up in `.planning/research/questions.md` → `## For Claude Science` (SQ-NNN).
 - **Compute jobs** Claude Science can't reach are run by Claude Code, with outputs in `science/runs/`.
+- **Auto-consult** (opt-in, `consult on`): while GSD works, a hook reminds you at each step to send new questions to Claude Science through Claude in Chrome, wait for the findings and ingest them. See **consult**.
 
 The format is defined in `${CLAUDE_PLUGIN_ROOT}/cs-skill/science-findings/references/format.md`. Read it the first time you use this skill in a session.
 
@@ -30,7 +31,7 @@ Run `status` and recommend the single next step:
 - no `last_selftest`, or its `skill_version` is below `skill_version`: **cs-setup**, then the self-test;
 - `selftest_pending`: **verify**;
 - pending findings: **ingest**;
-- open requests: tell the user to say "process the open SQ requests" in Claude Science;
+- open requests: with `consult.auto` true and `consult.unsent` not empty, **consult**; otherwise tell the user to say "process the open SQ requests" in Claude Science, or offer **consult** to send them through Chrome;
 - `outbox.redundant` is not empty: **outbox-clean**.
 
 ## Free-text arguments
@@ -175,6 +176,43 @@ Claude Science has no API, so you can't ask it whether it's done. But its result
    - **Without `--yes`:** offer to commit `science/` and `.planning/` together.
    - **With `--yes`:** commit the changes this ingest made under `science/` and `.planning/` in one commit, with the message `docs: route Claude Science findings (science-bridge)`. Those changes are the archived findings and attachments, their removal from `inbox/`, `routing.jsonl`, `questions.md`, and the notes, todos and seeds that were captured. Stage only those paths, and leave other uncommitted changes alone. Then finish without follow-up questions, except about conflicts. List anything left for the user: conflicts still in the inbox, invalid findings, other uncommitted changes and open SQ items.
 
+## consult: consult Claude Science during GSD work (auto-consult)
+
+Claude Science still can't be called by a program. Auto-consult makes **you**, the session running GSD, do the round that a person used to do: send the queued questions, wait for the findings, ingest them. It is off until the user turns it on.
+
+- **Turn it on or off** only when the user asks: `consult on [--wait-minutes N]` or `consult off`. It writes `"consult": {"auto": …, "wait_minutes": …}` into `science/policy.json` (default wait 120 minutes). Tell the user what it means:
+  - you will drive Claude Science in Chrome on their behalf;
+  - findings are ingested with the default routes, as with `ingest --yes`;
+  - conflicts with decisions still come to them;
+  - the prerequisites: Claude Code started with Chrome (`claude --chrome`), the Claude in Chrome extension connected with site access to `http://localhost:8765`, and Claude Science running (`claude-science serve`).
+
+  Offer to commit `science/policy.json`.
+- **When to run a round:**
+  - a `[science-bridge auto-consult]` reminder appears in your context. A PostToolUse hook on the Agent/Task/Skill tools adds it when auto-consult is on and there are unsent questions or waiting findings. Each step of a GSD workflow calls one of these tools, so the reminder arrives before the next step: before the planner after a researcher queued something, before execution after planning;
+  - or the user runs `consult`.
+
+  The hook stays silent inside subagents and doesn't repeat an unchanged reminder for 30 minutes.
+- **The round:**
+  1. **Look first.** Run `consult` (status). It lists `unsent` questions, `sent_awaiting` ones, `pending_findings` and `claude_science` (running, url). If `next` is "nothing to do", stop.
+  2. **Findings first.** If findings are waiting, run **ingest** with `--yes` (auto-consult is the user's pre-approval of the default routes). A finding that conflicts with a decision stays in the inbox. If it touches the phase you are about to plan or execute, stop and ask the user before going on. Otherwise list it at the end.
+  3. **Check the prerequisites.** You need the Claude in Chrome tools (load them; `tabs_context_mcp` must answer) and `claude_science.running` true. If either is missing, tell the user in one line which one. Leave the questions queued, so they are answered in the next round, and continue. Never retry in a loop.
+  4. **Send the unsent questions.** Use the rules in "Driving Claude Science":
+     - open a tab of your own at the `url`, and open this project's Claude Science project;
+     - start a new session, so it runs the current skill;
+     - when the composer is idle, send: *"Process the open SQ requests SQ-004, SQ-005 (the ids from `unsent`). Write each answer as a finding in science/inbox/."*;
+     - check that your message appears, then run `consult sent SQ-004 SQ-005`.
+  5. **Wait.** Start `wait --new-only --timeout 120` in the background, and handle each timeout as under "Waiting for Claude Science": approvals within scope, questions relayed or answered from `.planning/`. Keep going until the findings arrive or `wait_minutes` has passed in total.
+     - **While you wait:** don't start work that depends on the answer. In GSD, that means don't spawn the planner, and don't execute plans whose tasks carry "pending SQ-NNN" for these items. Work that doesn't depend on the answer may go on.
+  6. **Use the answer.** Run **ingest** `--yes`. Then find the plans that carry "pending SQ-NNN" for an answered item (`grep -rn "pending SQ-NNN" .planning/phases/`).
+     - If their phase hasn't executed yet, revise them before execution: re-run `/gsd-plan-phase <N>` and choose to replan, or update the affected tasks if the change is small.
+     - If it already executed, capture a todo saying the answer arrived after execution and what it changes.
+  7. **Time out gracefully.** If `wait_minutes` passes with no finding, tell the user in one line that the questions stay sent. Continue on the assumptions the agents marked "pending SQ-NNN". The hook reminds you when the findings land.
+- **Limits to tell the user once:**
+  - questions raised inside subagents are sent at the orchestrator's next step, not instantly;
+  - `/gsd-autonomous --interactive` runs plan and execute as background agents, so the reminder only arrives at the next discuss step;
+  - Claude Science's approval prompts follow "Driving Claude Science", so credentials and writes outside the grants still need the user;
+  - if Claude Science's page changes and Chrome steps fail, the round falls back to the queue.
+
 ## run <finding>: run a compute job Claude Science proposed
 
 Use this when the user starts a "Run for Claude Science" todo, or asks to run a proposal.
@@ -190,7 +228,7 @@ Use this when the user starts a "Run for Claude Science" todo, or asks to run a 
 
 ## status / check / gsd-setup / export / outbox-clean / compute-check
 
-- `status`: what is pending, open requests, versions, the last self-test, and the GSD wiring.
+- `status`: what is pending, open requests, auto-consult state (`consult`), versions, the last self-test, and the GSD wiring.
 - `check`: verifies the outbox against `MANIFEST.json` and validates inbox findings.
   - `outbox.stale` lists exported files whose source changed; offer to re-export them.
   - `outbox.redundant` (only in `repo-readonly`) lists old copies of repo files; offer `outbox-clean`. They never make `check` fail.

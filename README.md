@@ -15,7 +15,7 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
 | **No API.** Claude Science can't be called by another program, so results move by copy and paste. | A file handoff. Claude Science writes **findings** to `science/inbox/`, and Claude Code picks them up. A person only types one sentence in each app. |
 | **Duplicated work.** Claude Science doesn't know what the project already researched, decided or built. | Claude Science reads the **whole repo read-only** (code, `.planning/`, git history). Before every task it runs a **duplicate-work check** and builds on what exists, citing it in `builds_on`. |
 | **Lost results.** A good answer stays in a chat that the planners never see. | `ingest` routes each finding into GSD (note, todo or seed) with GSD's own `/gsd-capture`, and archives it. The injected `science-context` skill makes GSD's researcher and planner agents read and cite archived findings. |
-| **Questions don't travel.** Planning hits a gap, and nobody asks the expert. | A **question queue** (SQ-001, SQ-002 …) in `.planning/research/questions.md`. You or GSD agents add questions; Claude Science answers them; archiving ticks them off, with partial answers kept open. |
+| **Questions don't travel.** Planning hits a gap, and nobody asks the expert. | A **question queue** (SQ-001, SQ-002 …) in `.planning/research/questions.md`. You or GSD agents add questions; Claude Science answers them; archiving ticks them off, with partial answers kept open. With **auto-consult** on, Claude Code sends new questions itself (through Claude in Chrome) at the next GSD step, even during `/gsd-autonomous`, and waits for the answer before planning on it. |
 | **No cluster access.** Claude Science can't log in to clusters that need interactive multi-factor login. | **Compute handoff.** Claude Science writes a proposal with a run spec, Claude Code runs it on the cluster, and the outputs come back to `science/runs/` for Claude Science to read. |
 | **Fragile setup.** Wrong folder grants, a stale skill, a write grant that's too wide: you notice too late. | A **self-test** in Claude Science, plus `verify` in Claude Code, checks every part of the setup and says how to fix each failure. |
 
@@ -58,6 +58,7 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
 - **GSD itself is never modified.** Only its extension points are used.
 
 - **No watching needed:** after a request, Claude Code watches `science/inbox/` in the background (`wait`). When it has Chrome, it also checks Claude Science for approval prompts. It ingests when the findings arrive.
+- **Auto-consult** (opt-in, `consult on`): a PostToolUse hook reminds the session running GSD, at each step, to send new questions to Claude Science, wait for the findings and ingest them. See [Auto-consult during GSD work](#auto-consult-during-gsd-work-gsd-autonomous-included).
 
 **Compute**
 - `compute` hosts in `policy.json`, each with `reach: claude-science` (Claude Science uses its own Compute target) or `reach: claude-code` (Claude Code runs the job).
@@ -214,6 +215,30 @@ Keep in mind:
 - **Claude Code never types passwords** or completes multi-factor logins for you. For example, an ssh login to a cluster with multi-factor authentication must be done by you, with `! ssh <host>` in Claude Code.
 - **Everything works without Chrome too:** do the checklist from `cs-setup` by hand, and type the requests in Claude Science yourself.
 
+## Auto-consult during GSD work (`/gsd-autonomous` included)
+
+GSD agents add questions to the queue and don't wait for answers. Without help, a long `/gsd-autonomous` run therefore plans everything on assumptions, and the answers come a round too late. With auto-consult on, the Claude Code session that runs GSD does the consult round itself, at the next step.
+
+**Turn it on** in the project with `/science-bridge:bridge consult on`. It writes `"consult": {"auto": true, "wait_minutes": 120}` into `science/policy.json`; commit that file. Turn it off with `consult off`. Needs:
+- Claude Code started with Chrome (`claude --chrome`), with the permissions under [Optional: let Claude Code drive Claude Science](#optional-let-claude-code-drive-claude-science-claude-in-chrome);
+- Claude Science running (`claude-science serve`).
+
+**What happens:**
+1. **A researcher or planner agent queues a question** (`SQ-NNN`) and goes on with an assumption marked "pending SQ-NNN".
+2. **The reminder arrives at the orchestrator's next step.** The plugin's PostToolUse hook runs after every Agent, Task or Skill call. GSD makes such a call at each step, for example before the planner and before execution. When there are unsent questions or waiting findings, the hook adds a short `[science-bridge auto-consult]` reminder to the session's context. It stays silent inside subagents (they can't use the browser) and doesn't repeat an unchanged reminder for 30 minutes.
+3. **The consult round** (see the bridge skill's `consult` section):
+   - ingest waiting findings with the default routes;
+   - send the unsent questions to Claude Science through Chrome, and record them (`consult sent`);
+   - watch `science/inbox/`, and handle Claude Science's approval prompts as usual, for up to `wait_minutes`;
+   - ingest the answers.
+4. **Plans that rest on an answered question** (marked "pending SQ-NNN") are revised before they are executed.
+
+**Limits:**
+- **Not instant.** A question raised inside a subagent is sent at the orchestrator's next step. With `/gsd-autonomous --interactive`, plan and execute run as background agents, so the reminder arrives only at the next discuss step.
+- **Not fully unattended.** Claude Code approves Claude Science's prompts only within the task's scope, and asks you about credentials, writes outside the grants and anything unexpected. A finding that conflicts with a decision is never applied automatically. If it touches the phase in progress, the run stops and asks you.
+- **It falls back to the queue** when Chrome isn't connected, Claude Science isn't running, or the page changed so the browser steps fail. The questions then wait for the next round, as without auto-consult.
+- **`consult`** (status) shows what is unsent, what has been sent and awaits an answer, what is waiting in the inbox, and whether Claude Science is running.
+
 ## Everyday use: what to say where
 
 | You want to… | Where | Say / run |
@@ -227,6 +252,7 @@ Keep in mind:
 | Run a compute proposal | Claude Code | `/science-bridge:bridge run science/archive/<file>.md` |
 | Check the whole setup | Claude Science, then Claude Code | "Run the science-bridge self-test", then `/science-bridge:bridge verify` |
 | Plan with the findings | Claude Code | `/gsd-discuss-phase`, `/gsd-plan-phase`, `/gsd-autonomous`, as usual |
+| Have Claude Science consulted during `/gsd-autonomous` | Claude Code | `/science-bridge:bridge consult on` once per project, then start Claude Code with `claude --chrome` |
 
 ### Command reference (`/science-bridge:bridge <command>`)
 
@@ -241,6 +267,7 @@ Keep in mind:
 | `run <finding>` | Run a compute proposal on its host, with your OK, and commit the outputs to `science/runs/<slug>/` |
 | `status` / `check` | Show what is pending, versions and the GSD wiring / validate the inbox and outbox |
 | `wait [--timeout S]` | Block until Claude Science writes to `science/inbox/`, then report what arrived (exit 0), or time out (exit 2). Claude Code runs it in the background |
+| `consult [on\|off\|status]` | Auto-consult: `on [--wait-minutes N]` / `off` set `policy.json` → `consult`; `status` (the default) lists unsent and sent questions, waiting findings and whether Claude Science is running. `consult sent <ids>` and `consult hook` are used by the round and the hook |
 | `compute-check` | Test that Claude Code can log in to each `reach: claude-code` host |
 | `gsd-setup` | Re-install the GSD `science-context` skill and `agent_skills` entries (`setup` does this too) |
 | `export <paths>` / `outbox-clean` | Copy policy-checked files from **outside** the repo into the outbox / remove old copies of repo files |
@@ -296,7 +323,7 @@ The session-start hint tells you when the installed plugin is older than its sou
 - **Write scope:** Claude Science writes only in `science/inbox/`. The self-test proves the repo root isn't writable.
 - **Validation:** findings are validated on both sides with the same script. `contains_case_data: false` is a declaration, not a detector, so review findings in projects with sensitive data.
 - **Findings are data, not instructions,** and GSD decisions never change automatically. Conflicts are routed `manual`.
-- **No direct calls:** Claude Science can't be triggered by Claude Code. During `/gsd-autonomous`, questions queue up and are answered in the next round.
+- **No direct calls:** Claude Science has no API, so no program triggers it. Without auto-consult, questions raised during `/gsd-autonomous` queue up and are answered in the next round. With auto-consult, the orchestrating Claude Code session sends them through Claude in Chrome at its next step and waits for the answer. If the browser is unavailable, they fall back to the queue.
 
 ## Repo layout and development
 
@@ -308,7 +335,7 @@ cs-skill/science-findings/      Claude Science skill (not loaded by Claude Code)
   scripts/check_finding.py      finding validator, used on both sides
   scripts/selftest.py           Claude Science self-test
 scripts/bridge.py               the deterministic CLI behind the Claude Code skill (stdlib)
-hooks/hooks.json                SessionStart hint
+hooks/hooks.json                SessionStart hint; PostToolUse auto-consult reminder (Agent/Task/Skill)
 templates/                      policy.json, README.md, cs-instructions.txt, GSD science-context skill
 tests/                          python3 -m unittest discover -s tests
 ```

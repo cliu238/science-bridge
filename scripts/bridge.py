@@ -49,6 +49,14 @@ Commands:
   ask TEXT [--by WHO] [--context P] [--affects IDS]
                                     append a new SQ-NNN request with the next free number
   wait [--timeout S] [--new-only]  block until Claude Science writes to science/inbox/ (exit 0) or time out (exit 2)
+  consult [status|on|off|sent IDS|hook] [--wait-minutes N]
+                                    auto-consult: `on`/`off` set policy.json "consult"; `status` lists
+                                    open SQ items not yet sent to Claude Science, sent ones awaiting an
+                                    answer, waiting findings and whether Claude Science is running;
+                                    `sent SQ-004 ...` records items handed over; `hook` is the
+                                    PostToolUse hook (Agent/Task/Skill): with auto-consult on, it adds a
+                                    reminder to the model's context when there is consult work (deduped,
+                                    silent inside subagents). Always exits 0.
   session-hint                      for the SessionStart hook: print up to 6 one-line reminders
                                     when there is something to act on; otherwise print nothing.
                                     Always exits 0.
@@ -153,6 +161,14 @@ BRIEF_PLACEHOLDER = "<!-- Fill in: what the project is, what you want from Claud
 SKILL_ZIP_SKIP = {"__pycache__", ".DS_Store"}
 MAX_HINT_LINES = 6
 SSH_TIMEOUT = 20
+
+CONSULT_DEFAULT_WAIT = 120   # minutes a consult round waits for Claude Science before work continues
+CONSULT_MAX_WAIT = 1440
+CONSULT_REHINT_MINUTES = 30  # the hook repeats an unchanged reminder at most this often
+CONSULT_STATE_REL = "science/.cache/consult.json"  # gitignored (science/.gitignore has .cache/)
+CONSULT_TAG = "[science-bridge auto-consult]"
+CS_CLI_ENV = "SCIENCE_BRIDGE_CS_CLI"  # tests: path to a fake `claude-science`, or "none"
+CS_URL = "http://localhost:%d"
 
 FIX_SELFTEST = 'In Claude Science, open a NEW session in this project and say "Run the science-bridge self-test".'
 FIX_SKILL = ("Run /science-bridge:bridge cs-setup, upload the skill zip it builds in Claude Science (Settings › Skills › "
@@ -336,6 +352,16 @@ def normalize_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
     policy.setdefault("skill_min_version", "0.0.0")
     if not isinstance(policy["skill_min_version"], str) or not VERSION_RE.match(policy["skill_min_version"]):
         raise BridgeError("policy.json: skill_min_version must look like 0.4.0")
+    consult = policy.get("consult")
+    if consult is not None:
+        if not isinstance(consult, dict):
+            raise BridgeError("policy.json: consult must be an object like {\"auto\": false, \"wait_minutes\": %d}"
+                              % CONSULT_DEFAULT_WAIT)
+        if "auto" in consult and not isinstance(consult["auto"], bool):
+            raise BridgeError("policy.json: consult.auto must be true or false")
+        wait = consult.get("wait_minutes", CONSULT_DEFAULT_WAIT)
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= CONSULT_MAX_WAIT:
+            raise BridgeError("policy.json: consult.wait_minutes must be a number from 0 to %d" % CONSULT_MAX_WAIT)
     policy["_legacy"] = legacy
     return policy
 
@@ -1439,6 +1465,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         "do_not_read": policy["do_not_read"],
         "compute": policy["compute"],
         "requests_open": [r for r in list_requests(root) if r["open"]],
+        "consult": {k: v for k, v in consult_report(root, policy, probe=False).items()
+                    if k in ("auto", "wait_minutes", "unsent", "sent_awaiting")},
         "selftest_pending": (root / "science" / "inbox" / SELFTEST_NAME).is_file(),
         "last_selftest": _last_selftest(root),
     })
@@ -1591,6 +1619,14 @@ def _hint_requests(root: Path) -> Optional[str]:
     open_requests = [r for r in list_requests(root) if r["open"]]
     if not open_requests:
         return None
+    if consult_settings(load_policy(root))["auto"]:
+        unsent = consult_report(root, probe=False)["unsent"]
+        if unsent:
+            return ("[science-bridge] auto-consult is on and %d question(s) haven't been sent to Claude Science (%s). "
+                    "Run /science-bridge:bridge consult to send them through Claude in Chrome."
+                    % (len(unsent), ", ".join(u["id"] for u in unsent[:6])))
+        return ("[science-bridge] %d question(s) were sent to Claude Science and await findings; "
+                "/science-bridge:bridge consult shows them." % len(open_requests))
     return ("[science-bridge] %d open question(s) for Claude Science (%s). In Claude Science, ask it to process the "
             "open SQ requests." % (len(open_requests), QUESTIONS_REL))
 
@@ -1719,6 +1755,203 @@ def cmd_session_hint(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- consult (auto-consult during GSD work)
+#
+# Claude Science has no API, so nothing here calls it. Auto-consult makes the *orchestrating* Claude Code session
+# do the consult round itself (send the queued SQ items through Claude in Chrome, wait for the findings, ingest
+# them) at the next checkpoint. The checkpoint is a PostToolUse hook on the Agent/Task/Skill tools: GSD workflows,
+# /gsd-autonomous included, call one of them at every step, and the hook adds a reminder to the model's context
+# when there is consult work. The round itself is described in skills/bridge/SKILL.md ("consult").
+
+def consult_settings(policy: Dict[str, Any]) -> Dict[str, Any]:
+    block = policy.get("consult") if isinstance(policy.get("consult"), dict) else {}
+    return {"auto": block.get("auto") is True, "wait_minutes": block.get("wait_minutes", CONSULT_DEFAULT_WAIT)}
+
+
+def _consult_state_path(root: Path) -> Path:
+    return root / CONSULT_STATE_REL
+
+
+def load_consult_state(root: Path) -> Dict[str, Any]:
+    try:
+        raw = json.loads(_consult_state_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
+    last = raw.get("last_hint") if isinstance(raw.get("last_hint"), dict) else {}
+    return {"sent": {str(k): str(v) for k, v in sent.items()}, "last_hint": last}
+
+
+def save_consult_state(root: Path, state: Dict[str, Any]) -> None:
+    path = _consult_state_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_atomic(path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+
+
+def claude_science_status() -> Dict[str, Any]:
+    """What `claude-science status` says, reduced to running/port/version/url. Never raises."""
+    cli = os.environ.get(CS_CLI_ENV) or shutil.which("claude-science")
+    if not cli or cli == "none":
+        return {"cli": False, "running": None,
+                "note": "claude-science is not on PATH; open Claude Science yourself and check it is running"}
+    try:
+        proc = subprocess.run([cli, "status"], capture_output=True, text=True, timeout=10)
+        data = json.loads(proc.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"cli": True, "running": None, "note": "claude-science status gave no readable answer"}
+    if not isinstance(data, dict):
+        return {"cli": True, "running": None, "note": "claude-science status gave no readable answer"}
+    running = data.get("running") is True
+    port = data.get("port") if isinstance(data.get("port"), int) else 8765
+    out = {"cli": True, "running": running, "version": data.get("version"), "url": CS_URL % port}
+    if not running:
+        out["note"] = "Claude Science is not running; start it with `claude-science serve`"
+    return out
+
+
+def consult_report(root: Path, policy: Optional[Dict[str, Any]] = None, probe: bool = True) -> Dict[str, Any]:
+    policy = policy if policy is not None else load_policy(root)
+    settings = consult_settings(policy)
+    state = load_consult_state(root)
+    open_items = [r for r in list_requests(root) if r["open"]]
+    unsent = [{"id": r["id"], "text": r["text"]} for r in open_items if r["id"] not in state["sent"]]
+    sent = [{"id": r["id"], "sent_at": state["sent"][r["id"]]} for r in open_items if r["id"] in state["sent"]]
+    pending = [Path(f["file"]).name for f in _inbox_report(root)["findings"]]
+    if pending:
+        nxt = "ingest the findings waiting in science/inbox/ (/science-bridge:bridge ingest --yes)"
+    elif unsent:
+        nxt = "send %s to Claude Science (the consult round in the bridge skill)" % ", ".join(u["id"] for u in unsent)
+    elif sent:
+        nxt = "wait for Claude Science's findings (bridge.py wait --new-only)"
+    else:
+        nxt = "nothing to do"
+    out = {"auto": settings["auto"], "wait_minutes": settings["wait_minutes"], "unsent": unsent,
+           "sent_awaiting": sent, "pending_findings": pending, "next": nxt}
+    if probe:
+        out["claude_science"] = claude_science_status()
+    return out
+
+
+def _write_consult_block(root: Path, auto: bool, wait: Optional[float]) -> Dict[str, Any]:
+    path = root / "science" / "policy.json"
+    raw = _read_policy_raw(path)
+    block = dict(raw.get("consult")) if isinstance(raw.get("consult"), dict) else {}
+    block["auto"] = auto
+    if wait is not None:
+        block["wait_minutes"] = int(wait) if float(wait).is_integer() else float(wait)
+    block.setdefault("wait_minutes", CONSULT_DEFAULT_WAIT)
+    new = dict(raw)
+    new["consult"] = block
+    normalize_policy(new)
+    _write_text_atomic(path, _json_pretty(new) + "\n")
+    return block
+
+
+def _consult_hint_text(report: Dict[str, Any]) -> str:
+    parts = []
+    if report["unsent"]:
+        shown = []
+        for item in report["unsent"][:5]:
+            text = item["text"].split("):", 1)[-1].split(" — ")[0].strip()
+            shown.append("%s (%s)" % (item["id"], text[:90] + ("…" if len(text) > 90 else "")))
+        more = " and %d more" % (len(report["unsent"]) - 5) if len(report["unsent"]) > 5 else ""
+        parts.append("%d question(s) for Claude Science are queued but not sent yet: %s%s."
+                     % (len(report["unsent"]), "; ".join(shown), more))
+    if report["pending_findings"]:
+        parts.append("%d Claude Science finding(s) are waiting in science/inbox/." % len(report["pending_findings"]))
+    return ("%s %s Auto-consult is on for this project, so before you start the next step, run the consult round "
+            "(the \"consult\" section of the science-bridge bridge skill, /science-bridge:bridge consult): ingest "
+            "waiting findings with --yes, send unsent questions to Claude Science through Claude in Chrome, and "
+            "wait up to %s minutes for the answers before continuing work that depends on them. If you can't use "
+            "Claude in Chrome here, don't try: say once that the questions stay queued, and continue."
+            % (CONSULT_TAG, " ".join(parts), report["wait_minutes"]))
+
+
+def consult_hook(payload: Dict[str, Any], now: Optional[_dt.datetime] = None) -> Optional[Dict[str, Any]]:
+    """The PostToolUse hook body. Returns the hook's JSON output, or None to stay silent."""
+    if payload.get("agent_id"):
+        return None  # inside a subagent: it can't drive Chrome; the main session gets the reminder next
+    root = find_project(_start_dir(payload.get("cwd") or None))
+    if root is None:
+        return None
+    policy = load_policy(root)
+    if not consult_settings(policy)["auto"]:
+        return None
+    report = consult_report(root, policy, probe=False)
+    if not report["unsent"] and not report["pending_findings"]:
+        return None
+    key = hashlib.sha256(json.dumps([[u["id"] for u in report["unsent"]], report["pending_findings"]])
+                         .encode("utf-8")).hexdigest()[:16]
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    state = load_consult_state(root)
+    last_at = _parse_utc(state["last_hint"].get("at"))
+    if state["last_hint"].get("key") == key and last_at is not None and \
+            (now - last_at).total_seconds() < CONSULT_REHINT_MINUTES * 60:
+        return None
+    state["last_hint"] = {"key": key, "at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    save_consult_state(root, state)
+    event = payload.get("hook_event_name") or "PostToolUse"
+    return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": _consult_hint_text(report)}}
+
+
+def cmd_consult(args: argparse.Namespace) -> int:
+    if args.action == "hook":
+        try:
+            payload = {}  # type: Dict[str, Any]
+            if not sys.stdin.isatty():
+                try:
+                    loaded = json.loads(sys.stdin.read() or "{}")
+                    payload = loaded if isinstance(loaded, dict) else {}
+                except ValueError:
+                    payload = {}
+            if not payload.get("cwd") and args.project_dir:
+                payload["cwd"] = args.project_dir
+            out = consult_hook(payload)
+            if out:
+                print(json.dumps(out, ensure_ascii=False))
+        except Exception:  # a hook must never break the tool call it follows
+            pass
+        return 0
+    root = require_project(args.project_dir)
+    if args.action in ("on", "off"):
+        if args.ids:
+            raise BridgeError("consult %s takes no SQ ids" % args.action)
+        block = _write_consult_block(root, args.action == "on", args.wait_minutes)
+        note = ("Auto-consult is on. At each GSD step Claude Code is reminded to send new SQ questions to Claude "
+                "Science through Claude in Chrome, wait up to %s minutes for the findings, and ingest them with the "
+                "default routes (conflicts still go to you). Needs Claude Code started with Chrome and Claude "
+                "Science running. Commit science/policy.json." % block["wait_minutes"]
+                if block["auto"] else "Auto-consult is off. Questions queue up for the next manual round.")
+        _emit({"ok": True, "consult": block, "note": note, "report": consult_report(root)})
+        return 0
+    if args.action == "sent":
+        if not args.ids:
+            raise BridgeError("consult sent needs the SQ ids you handed to Claude Science, e.g. SQ-004 SQ-005")
+        items = {r["id"]: r for r in list_requests(root)}
+        state = load_consult_state(root)
+        recorded, closed, unknown = [], [], []
+        for sq in args.ids:
+            sq = sq.strip().upper()
+            if sq not in items:
+                unknown.append(sq)
+            elif not items[sq]["open"]:
+                closed.append(sq)
+            else:
+                state["sent"][sq] = _now()
+                recorded.append(sq)
+        if recorded:
+            save_consult_state(root, state)
+        _emit({"ok": not unknown, "recorded": recorded, "already_answered": closed, "unknown": unknown,
+               "next": "start `wait --new-only` in the background" if recorded else None})
+        return 0 if not unknown else 1
+    if args.ids:
+        raise BridgeError("consult status takes no SQ ids")
+    _emit({"ok": True, **consult_report(root)})
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1759,11 +1992,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--interval", type=float, default=10, help="poll interval in seconds (default 10)")
     p.add_argument("--settle", type=float, default=20, help="quiet seconds before reporting (default 20)")
     p.add_argument("--new-only", action="store_true", help="ignore findings already waiting at start")
+    p = sub.add_parser("consult")
+    p.add_argument("action", nargs="?", default="status", choices=("status", "on", "off", "sent", "hook"))
+    p.add_argument("ids", nargs="*", help="for `sent`: the SQ ids handed to Claude Science")
+    p.add_argument("--wait-minutes", type=float, default=None,
+                   help="for `on`: how long a consult round waits for findings (default %d)" % CONSULT_DEFAULT_WAIT)
     args = ap.parse_args(argv)
     handlers = {"init": cmd_init, "export": cmd_export, "check": cmd_check, "status": cmd_status,
                 "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup,
                 "requests": cmd_requests, "ask": cmd_ask, "cs-setup": cmd_cs_setup, "skill-zip": cmd_skill_zip,
-                "verify": cmd_verify, "compute-check": cmd_compute_check, "outbox-clean": cmd_outbox_clean, "wait": cmd_wait}
+                "verify": cmd_verify, "compute-check": cmd_compute_check, "outbox-clean": cmd_outbox_clean, "wait": cmd_wait,
+                "consult": cmd_consult}
     try:
         return handlers[args.cmd](args)
     except BridgeError as e:

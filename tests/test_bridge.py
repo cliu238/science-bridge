@@ -1345,3 +1345,159 @@ class WaitForInbox(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertTrue(out["selftest_waiting"])
         self.assertEqual(out["next"], ["/science-bridge:bridge verify"])
+
+
+class AutoConsult(unittest.TestCase):
+    """`consult`: opt-in auto-consult. The PostToolUse hook reminds the orchestrating session to send queued SQ
+    items to Claude Science; nothing calls Claude Science itself (it has no API)."""
+
+    def setUp(self):
+        self._which = bridge.shutil.which
+        bridge.shutil.which = lambda name: None
+        self._env = os.environ.get(bridge.CS_CLI_ENV)
+        os.environ[bridge.CS_CLI_ENV] = "none"
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        (self.root / ".planning" / "research").mkdir(parents=True)
+        (self.root / ".planning" / "config.json").write_text("{}")
+        run(["--project-dir", str(self.root), "init"])
+        self.policy = self.root / "science" / "policy.json"
+
+    def tearDown(self):
+        bridge.shutil.which = self._which
+        if self._env is None:
+            os.environ.pop(bridge.CS_CLI_ENV, None)
+        else:
+            os.environ[bridge.CS_CLI_ENV] = self._env
+
+    def ask(self, text):
+        code, out = run(["--project-dir", str(self.root), "ask", text, "--by", "gsd-phase-researcher phase 2"])
+        self.assertEqual(code, 0, out)
+        return out["id"]
+
+    def hook(self, payload=None, raw=None):
+        env = {**os.environ, "CLAUDE_PROJECT_DIR": "", bridge.CS_CLI_ENV: "none"}
+        body = raw if raw is not None else json.dumps(
+            {"cwd": str(self.root), "hook_event_name": "PostToolUse", "tool_name": "Skill", **(payload or {})})
+        proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "bridge.py"), "consult", "hook"],
+                              input=body, capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        return json.loads(proc.stdout) if proc.stdout.strip() else None
+
+    def test_on_and_off_write_the_policy_block_and_keep_other_keys(self):
+        before = read_json(self.policy)
+        code, out = run(["--project-dir", str(self.root), "consult", "on", "--wait-minutes", "90"])
+        self.assertEqual(code, 0, out)
+        policy = read_json(self.policy)
+        self.assertEqual(policy["consult"], {"auto": True, "wait_minutes": 90})
+        self.assertEqual({k: v for k, v in policy.items() if k != "consult"}, before)
+        code, out = run(["--project-dir", str(self.root), "consult", "off"])
+        self.assertEqual(read_json(self.policy)["consult"], {"auto": False, "wait_minutes": 90})
+        code, out = run(["--project-dir", str(self.root), "consult", "on", "--wait-minutes", "5000"])
+        self.assertEqual(code, 1)
+        self.assertIn("wait_minutes", out["error"])
+        self.assertEqual(read_json(self.policy)["consult"]["auto"], False, "a refused change writes nothing")
+
+    def test_invalid_consult_block_is_refused_by_every_command(self):
+        policy = read_json(self.policy)
+        policy["consult"] = {"auto": "yes"}
+        write_json(self.policy, policy)
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertEqual(code, 1)
+        self.assertIn("consult.auto", out["error"])
+
+    def test_status_splits_unsent_and_sent_and_points_to_the_next_step(self):
+        a, b = self.ask("First question"), self.ask("Second question")
+        code, out = run(["--project-dir", str(self.root), "consult"])
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["auto"])
+        self.assertEqual([u["id"] for u in out["unsent"]], [a, b])
+        self.assertIn(a, out["next"])
+        self.assertFalse(out["claude_science"]["cli"])
+        code, out = run(["--project-dir", str(self.root), "consult", "sent", a, "SQ-999"])
+        self.assertEqual(code, 1, "an unknown id is reported")
+        self.assertEqual(out["recorded"], [a])
+        self.assertEqual(out["unknown"], ["SQ-999"])
+        code, out = run(["--project-dir", str(self.root), "consult"])
+        self.assertEqual([u["id"] for u in out["unsent"]], [b])
+        self.assertEqual([s["id"] for s in out["sent_awaiting"]], [a])
+        run(["--project-dir", str(self.root), "consult", "sent", b])
+        code, out = run(["--project-dir", str(self.root), "consult"])
+        self.assertIn("wait", out["next"])
+        (self.root / "science" / "inbox" / "2026-11-06-larynx-stage-groups.md").write_text(VALID)
+        code, out = run(["--project-dir", str(self.root), "consult"])
+        self.assertIn("ingest", out["next"])
+        self.assertEqual(out["pending_findings"], ["2026-11-06-larynx-stage-groups.md"])
+
+    def test_status_reads_claude_science_through_its_cli(self):
+        fake = Path(tempfile.mkdtemp()) / "claude-science"
+        fake.write_text("#!/bin/sh\necho '{\"running\": true, \"port\": 9999, \"version\": \"0.1.72\", "
+                        "\"daemon\": {\"data_dir\": \"/secret\"}}'\n")
+        fake.chmod(0o755)
+        os.environ[bridge.CS_CLI_ENV] = str(fake)
+        code, out = run(["--project-dir", str(self.root), "consult"])
+        self.assertEqual(out["claude_science"], {"cli": True, "running": True, "version": "0.1.72",
+                                                 "url": "http://localhost:9999"})
+
+    def test_hook_is_silent_when_off_or_outside_a_project(self):
+        self.ask("A question")
+        self.assertIsNone(self.hook())
+        self.assertIsNone(self.hook(raw=json.dumps({"cwd": tempfile.mkdtemp(), "hook_event_name": "PostToolUse"})))
+        self.assertIsNone(self.hook(raw="not json"))
+        self.assertIsNone(self.hook(raw=""))
+
+    def test_hook_reminds_once_per_change_and_never_inside_subagents(self):
+        run(["--project-dir", str(self.root), "consult", "on"])
+        self.assertIsNone(self.hook(), "nothing queued, nothing to say")
+        a = self.ask("Which rank statistic should the screen use?")
+        self.assertIsNone(self.hook({"agent_id": "abc123", "agent_type": "gsd-planner"}),
+                          "a subagent can't drive Chrome; the main session hears it next")
+        out = self.hook({"tool_name": "Agent"})
+        ctx = out["hookSpecificOutput"]
+        self.assertEqual(ctx["hookEventName"], "PostToolUse")
+        self.assertIn(bridge.CONSULT_TAG, ctx["additionalContext"])
+        self.assertIn(a, ctx["additionalContext"])
+        self.assertIn("120 minutes", ctx["additionalContext"])
+        self.assertIsNone(self.hook(), "an unchanged reminder is not repeated at once")
+        b = self.ask("Second question")
+        out = self.hook()
+        self.assertIn(b, out["hookSpecificOutput"]["additionalContext"])
+        run(["--project-dir", str(self.root), "consult", "sent", a, b])
+        self.assertIsNone(self.hook(), "everything sent, nothing waiting")
+        (self.root / "science" / "inbox" / "2026-11-06-larynx-stage-groups.md").write_text(VALID)
+        out = self.hook()
+        self.assertIn("1 Claude Science finding(s) are waiting", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_hook_repeats_an_unchanged_reminder_after_the_interval(self):
+        run(["--project-dir", str(self.root), "consult", "on"])
+        self.ask("A question")
+        self.assertIsNotNone(self.hook())
+        self.assertIsNone(self.hook())
+        state_path = self.root / bridge.CONSULT_STATE_REL
+        state = read_json(state_path)
+        old = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=bridge.CONSULT_REHINT_MINUTES + 1)
+        state["last_hint"]["at"] = old.strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_json(state_path, state)
+        self.assertIsNotNone(self.hook())
+
+    def test_state_lives_in_the_gitignored_cache(self):
+        self.assertTrue(bridge.CONSULT_STATE_REL.startswith("science/.cache/"))
+        self.assertIn(".cache/", (self.root / "science" / ".gitignore").read_text())
+
+    def test_session_hint_says_consult_when_auto_is_on(self):
+        a = self.ask("A question")
+        run(["--project-dir", str(self.root), "consult", "on"])
+        line = bridge._hint_requests(self.root)
+        self.assertIn("auto-consult is on", line)
+        self.assertIn(a, line)
+        run(["--project-dir", str(self.root), "consult", "sent", a])
+        self.assertIn("await findings", bridge._hint_requests(self.root))
+
+    def test_hooks_json_registers_the_consult_hook(self):
+        hooks = read_json(ROOT / "hooks" / "hooks.json")["hooks"]
+        self.assertIn("SessionStart", hooks)
+        post = hooks["PostToolUse"]
+        self.assertEqual(len(post), 1)
+        self.assertEqual(set(post[0]["matcher"].split("|")), {"Agent", "Task", "Skill"})
+        self.assertIn("consult hook", post[0]["hooks"][0]["command"])
+        self.assertLessEqual(post[0]["hooks"][0]["timeout"], 10)
