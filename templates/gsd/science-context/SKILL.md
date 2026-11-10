@@ -1,16 +1,20 @@
 ---
 name: science-context
-description: For GSD agents (researchers, planners, checkers) in a project that uses science-bridge. Explains how to find and use Claude Science findings that were reviewed and routed into this project (science/archive/), how much weight to give them, and what not to do with them. Injected through .planning/config.json agent_skills; not meant to be invoked directly.
+description: For GSD agents (researchers, planners, checkers, executors, debuggers, verifiers) in a project that uses science-bridge. Explains how to find and use Claude Science findings that were reviewed and routed into this project (science/archive/), how much weight to give them, what not to do with them, and when to queue a question for Claude Science. Injected through .planning/config.json agent_skills; not meant to be invoked directly.
 disable-model-invocation: true
 ---
 
-<!-- Managed by science-bridge (template science-context v4). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
+<!-- Managed by science-bridge (template science-context v5). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
 
 # Claude Science findings in this project
 
 This project exchanges files with **Claude Science** through the `science/` folder (science-bridge, format `science-finding/v0.1`). Claude Science writes **findings**: literature summaries, rule or guideline checks, analysis results, and analysis proposals. A person reviews each one and routes it into `.planning/`, as a note, a todo or a seed. The original finding then moves to `science/archive/`.
 
 If the project has no `science/` folder, ignore this skill.
+
+**Which parts apply to you:**
+- researchers, planners, checkers and roadmappers: all of it;
+- executors, debuggers and verifiers: "Ask Claude Science" and "Limits". Read a finding only when your task's context or sources cite it.
 
 ## When you research or plan, do this
 
@@ -30,11 +34,22 @@ If the project has no `science/` folder, ignore this skill.
 
 Claude Science can't be called from here. Questions reach it in one of two ways, and it can read this repo read-only:
 - a person carries them over;
-- with auto-consult on (`science/policy.json` → `"consult": {"auto": true}`), the session orchestrating GSD sends them through the browser at its next step and may wait for the answer before it plans or executes. When your work raises a question that needs expert scientific work, add it to the request queue. Examples of such work:
+- with auto-consult on (`science/policy.json` → `"consult": {"auto": true}`), the session orchestrating GSD sends them through the browser at its next step and may wait for the answer before it plans or executes.
+
+Add a question to the request queue in two situations.
+
+**Your work raises a question that needs expert scientific work.** Examples of such work:
 - a literature search;
 - a domain-rule or guideline check;
 - a statistics or design review;
 - an analysis on data you can't run.
+
+**You are about to hand a decision or a blocker back.** This covers a decision checkpoint, a blocked or inconclusive result, and a failure whose cause you could not establish after a real attempt. If the open part is a research, analysis or design question:
+- queue it before you return;
+- write it neutrally: what has to be settled, every option, the evidence so far, and no recommendation of your own;
+- name the SQ id in what you return.
+
+The orchestrator then consults Claude Science before the owner is asked, and the owner sees both views. Leave out choices Claude Science can't help with: a preference, an approval, a login.
 
 To add a question:
 1. Open `.planning/research/questions.md` and find the `## For Claude Science` section. If it is missing, add it at the end of the file.
@@ -42,7 +57,7 @@ To add a question:
 3. Append one line at the end of that section. Use the next free number:
 
    `- [ ] SQ-NNN (YYYY-MM-DD, <your agent type> phase <N>): <the question, self-contained> — context: <repo paths>; affects: <requirement IDs>`
-4. **Don't wait for the answer.** Continue with an explicit assumption, and mark it in your output as "pending SQ-NNN". Answers arrive as findings with `answers: [SQ-NNN]`, and the next research or planning round picks them up.
+4. **Don't wait for the answer.** Continue with an explicit assumption, and mark it in your output as "pending SQ-NNN". If you are handing the question back, return as usual. Answers arrive as findings with `answers: [SQ-NNN]`, and the next research or planning round picks them up.
 5. **Planners: mark every task that rests on the assumption** with "pending SQ-NNN", in its context or sources. When the answer arrives, the orchestrator searches for that marker to find the plans to revise before execution.
 
 Add questions only for real gaps. Don't add one for anything you can settle with your own tools.

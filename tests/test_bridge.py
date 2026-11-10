@@ -287,7 +287,8 @@ class GsdIntegration(unittest.TestCase):
         self.cfg_path = self.root / ".planning" / "config.json"
         self.cfg_path.write_text(json.dumps({
             "mode": "yolo",
-            "agent_skills": {"gsd-planner": [".claude/skills/house-style"], "gsd-executor": "global:lint"},
+            "agent_skills": {"gsd-planner": [".claude/skills/house-style"], "gsd-executor": "global:lint",
+                             "gsd-ui-auditor": "global:lint"},
             "workflow": {"research": True},
         }, indent=2))
 
@@ -314,7 +315,11 @@ class GsdIntegration(unittest.TestCase):
         self.assertEqual(cfg["mode"], "yolo")
         self.assertEqual(cfg["workflow"], {"research": True})
         self.assertEqual(cfg["agent_skills"]["gsd-planner"], [".claude/skills/house-style", ".claude/skills/science-context"])
-        self.assertEqual(cfg["agent_skills"]["gsd-executor"], "global:lint", "agents not in the list must be untouched")
+        self.assertEqual(cfg["agent_skills"]["gsd-executor"], ["global:lint", ".claude/skills/science-context"],
+                         "a single-string entry is kept and the skill added beside it")
+        self.assertEqual(cfg["agent_skills"]["gsd-ui-auditor"], "global:lint", "agents not in the list must be untouched")
+        for agent in ("gsd-executor", "gsd-debugger", "gsd-verifier"):
+            self.assertIn(agent, bridge.GSD_DEFAULT_AGENTS, "the agents that hand decisions and blockers back")
         for agent in bridge.GSD_DEFAULT_AGENTS:
             self.assertIn(".claude/skills/science-context", cfg["agent_skills"][agent])
 
@@ -1495,9 +1500,161 @@ class AutoConsult(unittest.TestCase):
 
     def test_hooks_json_registers_the_consult_hook(self):
         hooks = read_json(ROOT / "hooks" / "hooks.json")["hooks"]
-        self.assertIn("SessionStart", hooks)
+        start = hooks["SessionStart"]
+        self.assertEqual(set(start[0]["matcher"].split("|")), {"startup", "resume", "clear", "compact"},
+                         "the standing rule must come back after /clear and after a compaction")
         post = hooks["PostToolUse"]
         self.assertEqual(len(post), 1)
-        self.assertEqual(set(post[0]["matcher"].split("|")), {"Agent", "Task", "Skill"})
+        self.assertEqual(set(post[0]["matcher"].split("|")), {"Agent", "Task", "Skill", "SubagentHandback"})
         self.assertIn("consult hook", post[0]["hooks"][0]["command"])
         self.assertLessEqual(post[0]["hooks"][0]["timeout"], 10)
+        stop = hooks["SubagentStop"]
+        self.assertEqual(len(stop), 1)
+        self.assertNotIn("matcher", stop[0], "every agent type, so any GSD agent's hand-back is seen")
+        self.assertIn("consult hook", stop[0]["hooks"][0]["command"])
+        self.assertLessEqual(stop[0]["hooks"][0]["timeout"], 10)
+        pre = hooks["PreToolUse"]
+        self.assertEqual(len(pre), 1)
+        self.assertEqual(pre[0]["matcher"], "AskUserQuestion")
+        self.assertIn("consult hook", pre[0]["hooks"][0]["command"])
+        self.assertLessEqual(pre[0]["hooks"][0]["timeout"], 10)
+
+    # ---- queueing on the session's own initiative: standing rule, hand-back reminder, ask gate
+
+    def gate(self, question="Which readout should the sub-label contrast use?", **extra):
+        return self.hook({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+                          "tool_input": {"questions": [{"question": question, "header": "Readout", "multiSelect": False,
+                                                        "options": [{"label": "A", "description": "a"},
+                                                                    {"label": "B", "description": "b"}]}]},
+                          **extra})
+
+    def age_gate(self, minutes):
+        state_path = self.root / bridge.CONSULT_STATE_REL
+        state = read_json(state_path)
+        old = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=minutes)
+        state["last_gate"]["at"] = old.strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_json(state_path, state)
+
+    def test_session_hint_carries_the_standing_rule_only_while_auto_is_on(self):
+        self.assertIsNone(bridge._hint_consult_rule(self.root))
+        run(["--project-dir", str(self.root), "consult", "on"])
+        line = bridge._hint_consult_rule(self.root)
+        self.assertIn("auto-consult is on", line)
+        self.assertIn("hard problem", line)
+        self.assertIn("before you ask the owner", line)
+        self.assertIn("/science-bridge:bridge", line)
+        self.assertNotIn("\n", line)
+        env = {**os.environ, "CLAUDE_PROJECT_DIR": "", "SCIENCE_BRIDGE_PLUGINS_DIR": tempfile.mkdtemp()}
+        proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "bridge.py"), "session-hint"],
+                              input=json.dumps({"cwd": str(self.root), "hook_event_name": "SessionStart"}),
+                              capture_output=True, text=True, timeout=30, env=env)
+        self.assertIn(line, proc.stdout, "printed with nothing queued, so a cleared session still knows the rule")
+        run(["--project-dir", str(self.root), "consult", "off"])
+        self.assertIsNone(bridge._hint_consult_rule(self.root))
+
+    def test_ask_gate_refuses_once_then_lets_the_question_through(self):
+        self.assertIsNone(self.gate(), "auto-consult off: the gate is silent")
+        run(["--project-dir", str(self.root), "consult", "on"])
+        self.assertIsNone(self.gate(agent_id="abc", agent_type="gsd-debug-session-manager"), "never inside subagents")
+        self.assertIsNone(self.hook({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                     "tool_input": {"command": "ls"}}), "only AskUserQuestion is gated")
+        out = self.gate()["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "PreToolUse")
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn(bridge.CONSULT_TAG, out["permissionDecisionReason"])
+        self.assertIn("call AskUserQuestion again", out["permissionDecisionReason"])
+        self.assertIsNone(self.gate(), "the same question asked again goes through")
+        self.assertIsNone(self.gate("A different question"), "no second refusal right after the first")
+        self.age_gate(bridge.CONSULT_REHINT_MINUTES + 1)
+        self.assertIsNone(self.gate(), "the refused question still passes after the interval")
+        self.assertIsNone(self.gate("SQ-012 found no prior work on B. Use A or B?"), "a question citing its SQ id passes")
+        self.assertEqual(self.gate("A different question")["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.age_gate(bridge.CONSULT_GATE_SAME_HOURS * 60 + 1)
+        self.assertIsNotNone(self.gate("A different question"), "a day later the same question is checked again")
+
+    def test_ask_gate_can_be_switched_off_and_is_validated(self):
+        code, out = run(["--project-dir", str(self.root), "consult", "on", "--ask-gate", "off"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(read_json(self.policy)["consult"], {"auto": True, "ask_gate": False, "wait_minutes": 120})
+        self.assertIn("ask gate off", out["note"])
+        self.assertIsNone(self.gate())
+        code, out = run(["--project-dir", str(self.root), "consult"])
+        self.assertIs(out["ask_gate"], False)
+        code, out = run(["--project-dir", str(self.root), "consult", "on"])
+        self.assertIs(read_json(self.policy)["consult"]["ask_gate"], False, "`on` keeps the stored choice")
+        code, out = run(["--project-dir", str(self.root), "consult", "on", "--ask-gate", "on"])
+        self.assertIsNotNone(self.gate())
+        code, out = run(["--project-dir", str(self.root), "consult", "status", "--ask-gate", "on"])
+        self.assertEqual(code, 1)
+        policy = read_json(self.policy)
+        policy["consult"]["ask_gate"] = "no"
+        write_json(self.policy, policy)
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertEqual(code, 1)
+        self.assertIn("consult.ask_gate", out["error"])
+        self.assertIsNone(self.gate(), "a hook never fails on a broken policy")
+
+    def stop(self, message, agent_type="gsd-executor"):
+        """A subagent finishing: SubagentStop runs inside it, so it carries agent_id and must print nothing."""
+        self.assertIsNone(self.hook({"hook_event_name": "SubagentStop", "agent_id": "a1", "agent_type": agent_type,
+                                     "stop_hook_active": False, "last_assistant_message": message}))
+
+    DECISION = "## CHECKPOINT REACHED\n\n**Type:** decision\n**Plan:** 02-14\n\n### Decision needed\nA or B"
+
+    def test_hand_back_is_noted_at_subagent_stop_and_told_to_the_orchestrator_once(self):
+        launched = {"tool_name": "Agent", "tool_response": {"isAsync": True, "status": "async_launched",
+                                                            "prompt": self.DECISION}}
+        self.stop(self.DECISION)
+        self.assertIsNone(self.hook(launched), "auto-consult off: nothing is noted")
+        run(["--project-dir", str(self.root), "consult", "on"])
+        self.assertIsNone(self.hook(launched), "the Agent call's own response (its prompt) is never read")
+        self.stop("## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Plan:** 02-14")
+        self.stop("## PLAN COMPLETE\n\nAll tasks done.")
+        self.assertIsNone(self.hook(), "a human-verify checkpoint and a finished plan are not hand-backs")
+        self.stop(self.DECISION)
+        ctx = self.hook()["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(bridge.CONSULT_TAG, ctx)
+        self.assertIn("A subagent (gsd-executor) returned a decision checkpoint", ctx)
+        self.assertIsNone(self.hook(), "told once")
+        self.stop("Tried three sources.\n\n## RESEARCH BLOCKED\n\nNo data.", "gsd-phase-researcher")
+        self.assertIn("a blocked or inconclusive result", self.hook()["hookSpecificOutput"]["additionalContext"])
+        self.stop("x\n## INVESTIGATION INCONCLUSIVE\n", "gsd-debugger")
+        self.assertIn("(gsd-debugger)", self.hook()["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(self.hook({"hook_event_name": "PostToolUse", "tool_name": "SubagentHandback", "agent_id": "a1",
+                                     "agent_type": "gsd-executor", "tool_input": {"message": self.DECISION}}),
+                          "a report delivered through SubagentHandback is noted the same way, silently")
+        a = self.ask("A question")
+        ctx = self.hook()["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(a, ctx, "the queue reminder and the hand-back reminder arrive together")
+        self.assertIn("a decision checkpoint", ctx)
+
+    def test_a_stale_hand_back_is_dropped(self):
+        run(["--project-dir", str(self.root), "consult", "on"])
+        self.stop(self.DECISION)
+        state_path = self.root / bridge.CONSULT_STATE_REL
+        state = read_json(state_path)
+        old = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=bridge.CONSULT_HANDBACK_MAX_MINUTES + 1)
+        state["handback"]["at"] = old.strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_json(state_path, state)
+        self.assertIsNone(self.hook())
+        self.assertEqual(read_json(state_path)["handback"], {})
+
+    def test_ask_gate_delivers_reminders_that_are_still_due(self):
+        run(["--project-dir", str(self.root), "consult", "on"])
+        self.assertIsNotNone(self.gate())
+        self.assertIsNone(self.gate(), "the gate is open after its own refusal")
+        self.stop(self.DECISION)
+        reason = self.gate()["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("returned a decision checkpoint", reason, "a hand-back closes the gate again, once")
+        self.assertIn("call AskUserQuestion again", reason)
+        self.assertIsNone(self.gate())
+        a = self.ask("A question")
+        out = self.gate("SQ-001 says B. Use A or B?")["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny", "unsent questions are reported before the owner is asked")
+        self.assertIn(a, out["permissionDecisionReason"])
+        self.assertIsNone(self.gate("SQ-001 says B. Use A or B?"))
+        self.assertIsNone(self.hook(), "the gate's reminder counts: PostToolUse doesn't repeat it")
+        run(["--project-dir", str(self.root), "consult", "on", "--ask-gate", "off"])
+        self.stop(self.DECISION)
+        self.assertIsNone(self.gate(), "with the gate off, AskUserQuestion is never refused")
+        self.assertIsNotNone(self.hook(), "and the hand-back reminder waits for the next Agent/Task/Skill call")

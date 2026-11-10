@@ -41,24 +41,37 @@ Commands:
                                     progress note to them instead)
   gsd-setup [--agents a,b,...]      GSD integration: install the science-context skill at
                                     .claude/skills/science-context/ and add it to
-                                    .planning/config.json agent_skills for researcher/planner
-                                    agents (merge only; existing entries are kept). `init` runs
-                                    this automatically when .planning/config.json exists.
+                                    .planning/config.json agent_skills for the researcher, planner,
+                                    checker, executor, debugger and verifier agents (merge only;
+                                    existing entries are kept). `init` runs this automatically
+                                    when .planning/config.json exists.
   requests [--all]                  list the request queue (SQ-NNN items in
                                     .planning/research/questions.md "## For Claude Science")
   ask TEXT [--by WHO] [--context P] [--affects IDS]
                                     append a new SQ-NNN request with the next free number
   wait [--timeout S] [--new-only]  block until Claude Science writes to science/inbox/ (exit 0) or time out (exit 2)
-  consult [status|on|off|sent IDS|hook] [--wait-minutes N]
+  consult [status|on|off|sent IDS|hook] [--wait-minutes N] [--ask-gate on|off]
                                     auto-consult: `on`/`off` set policy.json "consult"; `status` lists
                                     open SQ items not yet sent to Claude Science, sent ones awaiting an
                                     answer, waiting findings and whether Claude Science is running;
-                                    `sent SQ-004 ...` records items handed over; `hook` is the
-                                    PostToolUse hook (Agent/Task/Skill): with auto-consult on, it adds a
-                                    reminder to the model's context when there is consult work (deduped,
-                                    silent inside subagents). Always exits 0.
+                                    `sent SQ-004 ...` records items handed over; `hook` is the hook body,
+                                    silent unless auto-consult is on and never run inside subagents:
+                                    - SubagentStop, and PostToolUse on SubagentHandback: notes, without
+                                      output, that a subagent handed back a GSD decision checkpoint or
+                                      a blocked/inconclusive result;
+                                    - PostToolUse (Agent/Task/Skill): adds a reminder to the model's
+                                      context when there is consult work (deduped) or such a hand-back
+                                      is noted;
+                                    - PreToolUse (AskUserQuestion), the ask gate: refuses the call once,
+                                      telling the model to consult Claude Science before it asks the
+                                      owner to decide; the refusal carries any reminder still due. The
+                                      same question asked again, a question that cites an SQ id, and
+                                      any question within 30 minutes of a refusal pass. `--ask-gate
+                                      off` (with `on`) disables it.
+                                    Always exits 0.
   session-hint                      for the SessionStart hook: print up to 6 one-line reminders
-                                    when there is something to act on; otherwise print nothing.
+                                    when there is something to act on, plus the standing auto-consult
+                                    rule while auto-consult is on; otherwise print nothing.
                                     Always exits 0.
 
 Every command except init and skill-zip locates the project by walking up from --project-dir
@@ -125,7 +138,8 @@ SKILL_VERSION = _skill_version(CS_SKILL_DIR / "SKILL.md") or "0.0.0"
 GSD_SKILL_TEMPLATE = TEMPLATES / "gsd" / "science-context" / "SKILL.md"
 GSD_SKILL_ENTRY = ".claude/skills/science-context"
 GSD_DEFAULT_AGENTS = ("gsd-phase-researcher", "gsd-project-researcher", "gsd-advisor-researcher",
-                      "gsd-assumptions-analyzer", "gsd-planner", "gsd-plan-checker", "gsd-roadmapper")
+                      "gsd-assumptions-analyzer", "gsd-planner", "gsd-plan-checker", "gsd-roadmapper",
+                      "gsd-executor", "gsd-debugger", "gsd-verifier")
 QUESTIONS_REL = ".planning/research/questions.md"
 REQUESTS_HEADING = "## For Claude Science"
 REQUESTS_COMMENT = ("<!-- Request queue for Claude Science (science-bridge). One line per question:\n"
@@ -165,8 +179,36 @@ SSH_TIMEOUT = 20
 CONSULT_DEFAULT_WAIT = 120   # minutes a consult round waits for Claude Science before work continues
 CONSULT_MAX_WAIT = 1440
 CONSULT_REHINT_MINUTES = 30  # the hook repeats an unchanged reminder at most this often
+CONSULT_GATE_SAME_HOURS = 24  # the ask gate lets the question it last refused through for this long
+CONSULT_HANDBACK_MAX_MINUTES = 120  # a noted hand-back that nobody was reminded of is dropped after this
 CONSULT_STATE_REL = "science/.cache/consult.json"  # gitignored (science/.gitignore has .cache/)
 CONSULT_TAG = "[science-bridge auto-consult]"
+SQ_ID_RE = re.compile(r"\bSQ-\d{3,}\b")
+# What GSD agents return when they hand a decision or a blocker back to the orchestrator.
+GSD_CHECKPOINT_RE = re.compile(r"^#{1,3} CHECKPOINT REACHED\b", re.MULTILINE)
+GSD_CHECKPOINT_DECISION_RE = re.compile(r"^\*\*Type:\*\*\s*\[?\s*(?:checkpoint:)?decision\b", re.MULTILINE | re.IGNORECASE)
+GSD_STUCK_RE = re.compile(r"^#{1,3} (?:[A-Z]+ )*(?:BLOCKED|INCONCLUSIVE)\b", re.MULTILINE)
+CONSULT_ASK_HOW = ("queue it with `ask` as a neutral, self-contained question (every option, without your own "
+                   "recommendation, with the context paths)")
+CONSULT_RULE_TEXT = ("[science-bridge] auto-consult is on for this project. Consult Claude Science on your own "
+                     "initiative, without waiting to be told: when you hit a hard problem that you can't settle with "
+                     "your own tools, and before you ask the owner to decide a research, analysis or design question. "
+                     "Load the bridge skill (/science-bridge:bridge), %s, run the consult round, then give the owner "
+                     "its finding beside your own recommendation." % CONSULT_ASK_HOW)
+CONSULT_GATE_TEXT = ("%s Auto-consult is on for this project, so Claude Science is consulted before the owner is "
+                     "asked to decide. If this is a research, analysis or design decision and Claude Science hasn't "
+                     "been consulted on it, don't ask yet: load the bridge skill (/science-bridge:bridge), %s, run "
+                     "the consult round, then ask again, giving its finding beside your own recommendation and naming "
+                     "the SQ id in the question. If it is not that kind of decision (a preference, a permission, "
+                     "something Claude Science can't judge), or it has already been consulted, call AskUserQuestion "
+                     "again with the same questions; they will go through."
+                     % (CONSULT_TAG, CONSULT_ASK_HOW))
+CONSULT_HANDBACK_TEXT = ("%s %%s returned %%s. Auto-consult is on for this project, so before you take "
+                         "it to the owner or settle it on your own, decide whether Claude Science should weigh in. "
+                         "If it is a research, analysis or design question, %s unless the agent already queued it, "
+                         "and run the consult round (the \"consult\" section of the bridge skill, "
+                         "/science-bridge:bridge consult). Then bring its finding to the owner beside your own "
+                         "recommendation." % (CONSULT_TAG, CONSULT_ASK_HOW))
 CS_CLI_ENV = "SCIENCE_BRIDGE_CS_CLI"  # tests: path to a fake `claude-science`, or "none"
 CS_URL = "http://localhost:%d"
 
@@ -359,6 +401,8 @@ def normalize_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
                               % CONSULT_DEFAULT_WAIT)
         if "auto" in consult and not isinstance(consult["auto"], bool):
             raise BridgeError("policy.json: consult.auto must be true or false")
+        if "ask_gate" in consult and not isinstance(consult["ask_gate"], bool):
+            raise BridgeError("policy.json: consult.ask_gate must be true or false")
         wait = consult.get("wait_minutes", CONSULT_DEFAULT_WAIT)
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= CONSULT_MAX_WAIT:
             raise BridgeError("policy.json: consult.wait_minutes must be a number from 0 to %d" % CONSULT_MAX_WAIT)
@@ -1466,7 +1510,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "compute": policy["compute"],
         "requests_open": [r for r in list_requests(root) if r["open"]],
         "consult": {k: v for k, v in consult_report(root, policy, probe=False).items()
-                    if k in ("auto", "wait_minutes", "unsent", "sent_awaiting")},
+                    if k in ("auto", "wait_minutes", "ask_gate", "unsent", "sent_awaiting")},
         "selftest_pending": (root / "science" / "inbox" / SELFTEST_NAME).is_file(),
         "last_selftest": _last_selftest(root),
     })
@@ -1631,6 +1675,14 @@ def _hint_requests(root: Path) -> Optional[str]:
             "open SQ requests." % (len(open_requests), QUESTIONS_REL))
 
 
+def _hint_consult_rule(root: Path) -> Optional[str]:
+    """The standing rule, printed at every session start (and after /clear or a compaction) while auto-consult is
+    on: without it a fresh session only hears about Claude Science once something is already queued."""
+    if not consult_settings(load_policy(root))["auto"]:
+        return None
+    return CONSULT_RULE_TEXT
+
+
 def _hint_gsd(root: Path) -> Optional[str]:
     gsd = gsd_report(root)
     if gsd.get("planning") and gsd.get("skill") in ("missing", "outdated"):
@@ -1651,7 +1703,7 @@ def _hint_outbox_redundant(root: Path) -> Optional[str]:
 
 
 SESSION_HINTS = (_hint_outbox, _hint_plugin_update, _hint_legacy_policy, _hint_selftest, _hint_findings,
-                 _hint_requests, _hint_gsd, _hint_outbox_redundant)
+                 _hint_requests, _hint_consult_rule, _hint_gsd, _hint_outbox_redundant)
 
 
 # ---------------------------------------------------------------- wait (watch the inbox)
@@ -1762,10 +1814,21 @@ def cmd_session_hint(args: argparse.Namespace) -> int:
 # them) at the next checkpoint. The checkpoint is a PostToolUse hook on the Agent/Task/Skill tools: GSD workflows,
 # /gsd-autonomous included, call one of them at every step, and the hook adds a reminder to the model's context
 # when there is consult work. The round itself is described in skills/bridge/SKILL.md ("consult").
+#
+# That hook only sees questions that are already queued. Three more pieces make the session queue them:
+# - the standing rule in the SessionStart hint (_hint_consult_rule);
+# - the hand-back reminder, when a GSD agent returns a decision checkpoint or a blocked/inconclusive result.
+#   Subagents usually run in the background, so PostToolUse on Agent fires when one is launched and its tool
+#   response holds no report. SubagentStop (and PostToolUse on SubagentHandback, where the report goes through that
+#   tool) sees the report instead. Its output would go to the subagent, so it only notes the hand-back in the
+#   state file; the orchestrator is told at its next Agent/Task/Skill call or by the ask gate;
+# - the ask gate, a PreToolUse hook on AskUserQuestion. A PreToolUse hook's additionalContext only reaches the model
+#   with the tool result, after the owner has answered, so the gate refuses the call once instead.
 
 def consult_settings(policy: Dict[str, Any]) -> Dict[str, Any]:
     block = policy.get("consult") if isinstance(policy.get("consult"), dict) else {}
-    return {"auto": block.get("auto") is True, "wait_minutes": block.get("wait_minutes", CONSULT_DEFAULT_WAIT)}
+    return {"auto": block.get("auto") is True, "wait_minutes": block.get("wait_minutes", CONSULT_DEFAULT_WAIT),
+            "ask_gate": block.get("ask_gate") is not False}
 
 
 def _consult_state_path(root: Path) -> Path:
@@ -1781,7 +1844,10 @@ def load_consult_state(root: Path) -> Dict[str, Any]:
         raw = {}
     sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
     last = raw.get("last_hint") if isinstance(raw.get("last_hint"), dict) else {}
-    return {"sent": {str(k): str(v) for k, v in sent.items()}, "last_hint": last}
+    gate = raw.get("last_gate") if isinstance(raw.get("last_gate"), dict) else {}
+    handback = raw.get("handback") if isinstance(raw.get("handback"), dict) else {}
+    return {"sent": {str(k): str(v) for k, v in sent.items()}, "last_hint": last, "last_gate": gate,
+            "handback": handback}
 
 
 def save_consult_state(root: Path, state: Dict[str, Any]) -> None:
@@ -1827,18 +1893,22 @@ def consult_report(root: Path, policy: Optional[Dict[str, Any]] = None, probe: b
         nxt = "wait for Claude Science's findings (bridge.py wait --new-only)"
     else:
         nxt = "nothing to do"
-    out = {"auto": settings["auto"], "wait_minutes": settings["wait_minutes"], "unsent": unsent,
+    out = {"auto": settings["auto"], "wait_minutes": settings["wait_minutes"], "ask_gate": settings["ask_gate"],
+           "unsent": unsent,
            "sent_awaiting": sent, "pending_findings": pending, "next": nxt}
     if probe:
         out["claude_science"] = claude_science_status()
     return out
 
 
-def _write_consult_block(root: Path, auto: bool, wait: Optional[float]) -> Dict[str, Any]:
+def _write_consult_block(root: Path, auto: bool, wait: Optional[float],
+                         ask_gate: Optional[bool] = None) -> Dict[str, Any]:
     path = root / "science" / "policy.json"
     raw = _read_policy_raw(path)
     block = dict(raw.get("consult")) if isinstance(raw.get("consult"), dict) else {}
     block["auto"] = auto
+    if ask_gate is not None:
+        block["ask_gate"] = ask_gate
     if wait is not None:
         block["wait_minutes"] = int(wait) if float(wait).is_integer() else float(wait)
     block.setdefault("wait_minutes", CONSULT_DEFAULT_WAIT)
@@ -1869,31 +1939,124 @@ def _consult_hint_text(report: Dict[str, Any]) -> str:
             % (CONSULT_TAG, " ".join(parts), report["wait_minutes"]))
 
 
+def _payload_text(value: Any, limit: int = 400000) -> str:
+    """Every string inside a hook payload value, one per line (tool inputs and responses come as str, dict or list)."""
+    parts = []  # type: List[str]
+
+    def walk(v: Any) -> None:
+        if isinstance(v, str):
+            parts.append(v)
+        elif isinstance(v, dict):
+            for item in v.values():
+                walk(item)
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                walk(item)
+
+    walk(value)
+    return "\n".join(parts)[:limit]
+
+
+def _handback_report(payload: Dict[str, Any]) -> Optional[str]:
+    """The report a subagent hands back, from the two events that carry it; None for every other event."""
+    event = payload.get("hook_event_name")
+    if event == "SubagentStop":
+        return _payload_text(payload.get("last_assistant_message"))
+    if event == "PostToolUse" and payload.get("tool_name") == "SubagentHandback":
+        tool_input = payload.get("tool_input")
+        return _payload_text(tool_input.get("message") if isinstance(tool_input, dict) else tool_input)
+    return None
+
+
+def _handback_kind(text: str) -> Optional[str]:
+    """What a GSD agent's report hands back to the orchestrator, if it is a decision or a blocker."""
+    if GSD_CHECKPOINT_RE.search(text) and GSD_CHECKPOINT_DECISION_RE.search(text):
+        return "a decision checkpoint"
+    if GSD_STUCK_RE.search(text):
+        return "a blocked or inconclusive result"
+    return None
+
+
+def _due_reminders(root: Path, policy: Dict[str, Any], state: Dict[str, Any], now: _dt.datetime) -> List[str]:
+    """The reminders the orchestrating session hasn't had yet: queued consult work (not repeated unchanged within
+    CONSULT_REHINT_MINUTES) and a noted hand-back (once). Marks them as given in STATE; the caller saves it."""
+    texts = []  # type: List[str]
+    report = consult_report(root, policy, probe=False)
+    if report["unsent"] or report["pending_findings"]:
+        key = hashlib.sha256(json.dumps([[u["id"] for u in report["unsent"]], report["pending_findings"]])
+                             .encode("utf-8")).hexdigest()[:16]
+        last_at = _parse_utc(state["last_hint"].get("at"))
+        if not (state["last_hint"].get("key") == key and last_at is not None and
+                (now - last_at).total_seconds() < CONSULT_REHINT_MINUTES * 60):
+            state["last_hint"] = {"key": key, "at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            texts.append(_consult_hint_text(report))
+    handback = state["handback"]
+    if handback:
+        state["handback"] = {}
+        noted_at = _parse_utc(handback.get("at"))
+        if noted_at is not None and (now - noted_at).total_seconds() < CONSULT_HANDBACK_MAX_MINUTES * 60:
+            agent = str(handback.get("agent") or "")
+            texts.append(CONSULT_HANDBACK_TEXT % ("A subagent (%s)" % agent if agent else "A subagent",
+                                                  handback.get("what") or "a decision or a blocker"))
+    return texts
+
+
+def _gate_is_due(state: Dict[str, Any], question: str, key: str, now: _dt.datetime) -> bool:
+    """Whether the ask gate should refuse this question on its own account. Not when the question names an SQ id,
+    within CONSULT_REHINT_MINUTES of the last refusal, or for the refused question itself (CONSULT_GATE_SAME_HOURS)."""
+    if SQ_ID_RE.search(question):
+        return False
+    last_at = _parse_utc(state["last_gate"].get("at"))
+    if last_at is None:
+        return True
+    age = (now - last_at).total_seconds()
+    if age < CONSULT_REHINT_MINUTES * 60:
+        return False
+    return not (state["last_gate"].get("key") == key and age < CONSULT_GATE_SAME_HOURS * 3600)
+
+
 def consult_hook(payload: Dict[str, Any], now: Optional[_dt.datetime] = None) -> Optional[Dict[str, Any]]:
-    """The PostToolUse hook body. Returns the hook's JSON output, or None to stay silent."""
-    if payload.get("agent_id"):
-        return None  # inside a subagent: it can't drive Chrome; the main session gets the reminder next
+    """The hook body for every registered event (see hooks/hooks.json). Returns the hook's JSON output, or None to
+    stay silent."""
     root = find_project(_start_dir(payload.get("cwd") or None))
     if root is None:
         return None
     policy = load_policy(root)
-    if not consult_settings(policy)["auto"]:
+    settings = consult_settings(policy)
+    if not settings["auto"]:
         return None
-    report = consult_report(root, policy, probe=False)
-    if not report["unsent"] and not report["pending_findings"]:
-        return None
-    key = hashlib.sha256(json.dumps([[u["id"] for u in report["unsent"]], report["pending_findings"]])
-                         .encode("utf-8")).hexdigest()[:16]
     now = now or _dt.datetime.now(_dt.timezone.utc)
-    state = load_consult_state(root)
-    last_at = _parse_utc(state["last_hint"].get("at"))
-    if state["last_hint"].get("key") == key and last_at is not None and \
-            (now - last_at).total_seconds() < CONSULT_REHINT_MINUTES * 60:
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    handed_back = _handback_report(payload)
+    if handed_back is not None:  # runs inside the subagent: note it for the orchestrator, say nothing here
+        kind = _handback_kind(handed_back)
+        if kind:
+            state = load_consult_state(root)
+            state["handback"] = {"what": kind, "agent": str(payload.get("agent_type") or ""), "at": stamp}
+            save_consult_state(root, state)
         return None
-    state["last_hint"] = {"key": key, "at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
-    save_consult_state(root, state)
+    if payload.get("agent_id"):
+        return None  # inside a subagent: it can't drive Chrome; the main session gets the reminder next
     event = payload.get("hook_event_name") or "PostToolUse"
-    return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": _consult_hint_text(report)}}
+    gate = event == "PreToolUse"
+    if gate and (payload.get("tool_name") != "AskUserQuestion" or not settings["ask_gate"]):
+        return None
+    state = load_consult_state(root)
+    before = json.dumps(state, sort_keys=True)
+    texts = _due_reminders(root, policy, state, now)
+    out = None  # type: Optional[Dict[str, Any]]
+    if gate:
+        question = _payload_text(payload.get("tool_input"))
+        key = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+        if texts or _gate_is_due(state, question, key, now):
+            state["last_gate"] = {"key": key, "at": stamp}
+            out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                          "permissionDecisionReason": "\n".join(texts + [CONSULT_GATE_TEXT])}}
+    elif texts:
+        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n".join(texts)}}
+    if json.dumps(state, sort_keys=True) != before:
+        save_consult_state(root, state)
+    return out
 
 
 def cmd_consult(args: argparse.Namespace) -> int:
@@ -1918,14 +2081,21 @@ def cmd_consult(args: argparse.Namespace) -> int:
     if args.action in ("on", "off"):
         if args.ids:
             raise BridgeError("consult %s takes no SQ ids" % args.action)
-        block = _write_consult_block(root, args.action == "on", args.wait_minutes)
+        gate = None if args.ask_gate is None else args.ask_gate == "on"
+        block = _write_consult_block(root, args.action == "on", args.wait_minutes, gate)
         note = ("Auto-consult is on. At each GSD step Claude Code is reminded to send new SQ questions to Claude "
                 "Science through Claude in Chrome, wait up to %s minutes for the findings, and ingest them with the "
-                "default routes (conflicts still go to you). Needs Claude Code started with Chrome and Claude "
-                "Science running. Commit science/policy.json." % block["wait_minutes"]
+                "default routes (conflicts still go to you). It is also told to queue hard problems and decisions "
+                "itself: at session start, when a GSD agent hands back a decision or a blocker, and %s. Needs "
+                "Claude Code started with Chrome and Claude Science running. Commit science/policy.json."
+                % (block["wait_minutes"],
+                   "before it asks you a question (the ask gate refuses the first attempt once)"
+                   if block.get("ask_gate") is not False else "not before it asks you a question (ask gate off)")
                 if block["auto"] else "Auto-consult is off. Questions queue up for the next manual round.")
         _emit({"ok": True, "consult": block, "note": note, "report": consult_report(root)})
         return 0
+    if args.ask_gate is not None:
+        raise BridgeError("--ask-gate goes with `consult on` or `consult off`")
     if args.action == "sent":
         if not args.ids:
             raise BridgeError("consult sent needs the SQ ids you handed to Claude Science, e.g. SQ-004 SQ-005")
@@ -1997,6 +2167,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("ids", nargs="*", help="for `sent`: the SQ ids handed to Claude Science")
     p.add_argument("--wait-minutes", type=float, default=None,
                    help="for `on`: how long a consult round waits for findings (default %d)" % CONSULT_DEFAULT_WAIT)
+    p.add_argument("--ask-gate", choices=("on", "off"), default=None,
+                   help="for `on`/`off`: whether the first AskUserQuestion is refused once so Claude Science is "
+                        "consulted before the owner is asked (default on)")
     args = ap.parse_args(argv)
     handlers = {"init": cmd_init, "export": cmd_export, "check": cmd_check, "status": cmd_status,
                 "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup,

@@ -1,6 +1,6 @@
 ---
 name: bridge
-description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up or upgrade a science/ handoff folder, prepare the one-time Claude Science setup, verify Claude Science's self-test, queue a question for Claude Science, route findings from science/inbox/ into GSD planning, run a compute job Claude Science proposed, or have Claude Science consulted automatically while GSD (including /gsd-autonomous) works, and whenever a "[science-bridge auto-consult]" reminder appears. Triggers include "science inbox", "Claude Science findings", "set up Claude Science", "self-test", "auto-consult", "处理 Claude Science 的结论", "给 Claude Science 提问", "自动咨询 Claude Science", "science-bridge".
+description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up or upgrade a science/ handoff folder, prepare the one-time Claude Science setup, verify Claude Science's self-test, queue a question for Claude Science, route findings from science/inbox/ into GSD planning, run a compute job Claude Science proposed, or have Claude Science consulted automatically while GSD (including /gsd-autonomous) works, and whenever a "[science-bridge auto-consult]" reminder appears. In a project with auto-consult on, also use it on your own initiative when you hit a hard problem you can't settle with your own tools, and before you ask the owner to decide a research, analysis or design question. Triggers include "science inbox", "Claude Science findings", "set up Claude Science", "self-test", "auto-consult", "处理 Claude Science 的结论", "给 Claude Science 提问", "自动咨询 Claude Science", "science-bridge".
 argument-hint: "[setup | cs-setup | verify | ask <question> | wait | requests | ingest [--yes] | consult [on|off|status] | run <finding> | status | check | gsd-setup | export <paths…> | outbox-clean [--yes]]"
 ---
 
@@ -11,7 +11,7 @@ Claude Science is a separate app that no other program can drive. The two sides 
 - **Claude Code routes** those findings into GSD (`.planning/`) and archives them in `science/archive/`.
 - **Questions** for Claude Science queue up in `.planning/research/questions.md` → `## For Claude Science` (SQ-NNN).
 - **Compute jobs** Claude Science can't reach are run by Claude Code, with outputs in `science/runs/`.
-- **Auto-consult** (opt-in, `consult on`): while GSD works, a hook reminds you at each step to send new questions to Claude Science through Claude in Chrome, wait for the findings and ingest them. See **consult**.
+- **Auto-consult** (opt-in, `consult on`): while GSD works, a hook reminds you at each step to send new questions to Claude Science through Claude in Chrome, wait for the findings and ingest them. You also queue questions yourself, for hard problems and before owner decisions. See **consult**.
 
 The format is defined in `${CLAUDE_PLUGIN_ROOT}/cs-skill/science-findings/references/format.md`. Read it the first time you use this skill in a session.
 
@@ -180,8 +180,9 @@ Claude Science has no API, so you can't ask it whether it's done. But its result
 
 Claude Science still can't be called by a program. Auto-consult makes **you**, the session running GSD, do the round that a person used to do: send the queued questions, wait for the findings, ingest them. It is off until the user turns it on.
 
-- **Turn it on or off** only when the user asks: `consult on [--wait-minutes N]` or `consult off`. It writes `"consult": {"auto": …, "wait_minutes": …}` into `science/policy.json` (default wait 120 minutes). Tell the user what it means:
+- **Turn it on or off** only when the user asks: `consult on [--wait-minutes N] [--ask-gate on|off]` or `consult off`. It writes `"consult": {"auto": …, "wait_minutes": …}` into `science/policy.json` (default wait 120 minutes). Tell the user what it means:
   - you will drive Claude Science in Chrome on their behalf;
+  - you will queue hard problems and decisions for Claude Science yourself, and the first question you put to them in a while is held back once while you check whether to consult first;
   - findings are ingested with the default routes, as with `ingest --yes`;
   - conflicts with decisions still come to them;
   - the prerequisites: Claude Code started with Chrome (`claude --chrome`), the Claude in Chrome extension connected with site access to `http://localhost:8765`, and Claude Science running (`claude-science serve`).
@@ -189,9 +190,25 @@ Claude Science still can't be called by a program. Auto-consult makes **you**, t
   Offer to commit `science/policy.json`.
 - **When to run a round:**
   - a `[science-bridge auto-consult]` reminder appears in your context. A PostToolUse hook on the Agent/Task/Skill tools adds it when auto-consult is on and there are unsent questions or waiting findings. Each step of a GSD workflow calls one of these tools, so the reminder arrives before the next step: before the planner after a researcher queued something, before execution after planning;
+  - you queued a question yourself (next item);
   - or the user runs `consult`.
 
   The hook stays silent inside subagents and doesn't repeat an unchanged reminder for 30 minutes.
+- **Queue questions yourself.** The hook only sees questions that are already in the queue, so with auto-consult on, the session that orchestrates the work adds them on its own initiative. Do this in two situations:
+  - **A hard problem.** You, or an agent you spawned, made a real attempt and can't settle it with the tools at hand, and the open part is a research, analysis or design question. Queue it instead of settling it with more internal sub-agents alone.
+  - **Before the owner decides.** You are about to ask the owner to choose (AskUserQuestion, a GSD decision checkpoint, or a plain-text question), and the choice turns on research, analysis or design judgment. Queue it first, so the owner gets Claude Science's view together with yours.
+
+  How:
+  1. Write the question so it stands alone and is neutral: what has to be settled, every option, the evidence so far, and the repo paths to read. Leave your own recommendation out, so the finding is an independent view.
+  2. Add it with `ask` (`--context`, `--affects`), then run the round below. While you wait, go on with work that doesn't depend on the answer.
+  3. Take the result to the owner: Claude Science's finding and your own recommendation, side by side, with the SQ id named in the question. If they disagree, say so and say why.
+  4. If the round times out or the browser isn't available, ask the owner anyway. Say that the question is still with Claude Science.
+
+  Don't queue what Claude Science can't help with: a preference, a permission or approval, a login, or anything that `.planning/` or an earlier ruling of the owner already settles. Don't queue the same question twice; `ask` refuses duplicates.
+- **What reminds you.** Each of these is a `[science-bridge]` line, and none of them fires inside subagents:
+  - **At session start**, also after `/clear` and after a compaction: the standing rule above, for as long as auto-consult is on.
+  - **When a GSD agent hands back a decision checkpoint or a blocked or inconclusive result:** a reminder at your next Agent, Task or Skill call, or in the ask gate's refusal if you call AskUserQuestion first. Agents run in the background, so the hook notes the hand-back when the agent stops and tells you at that next call. The agents that carry the science-context skill are told to queue such questions themselves and to name the SQ id in what they return, so check `requests` before you add one.
+  - **The ask gate.** The first AskUserQuestion call is refused once, with the rule as the reason. A refusal also carries any reminder that is still due: unsent questions, waiting findings, a hand-back. If the question is one for Claude Science, consult first and ask again with the SQ id in the question. If it isn't, or it was already consulted, repeat the same call and it goes through. After a refusal the gate stays open for 30 minutes. `consult on --ask-gate off` switches it off; it writes `"ask_gate": false` into the `consult` block.
 - **The round:**
   1. **Look first.** Run `consult` (status). It lists `unsent` questions, `sent_awaiting` ones, `pending_findings` and `claude_science` (running, url). If `next` is "nothing to do", stop.
   2. **Findings first.** If findings are waiting, run **ingest** with `--yes` (auto-consult is the user's pre-approval of the default routes). A finding that conflicts with a decision stays in the inbox. If it touches the phase you are about to plan or execute, stop and ask the user before going on. Otherwise list it at the end.
@@ -232,7 +249,7 @@ Use this when the user starts a "Run for Claude Science" todo, or asks to run a 
 - `check`: verifies the outbox against `MANIFEST.json` and validates inbox findings.
   - `outbox.stale` lists exported files whose source changed; offer to re-export them.
   - `outbox.redundant` (only in `repo-readonly`) lists old copies of repo files; offer `outbox-clean`. They never make `check` fail.
-- `gsd-setup [--agents a,b,...]` (`init` runs it too): installs `.claude/skills/science-context/SKILL.md` and adds it to `.planning/config.json` `agent_skills` for the GSD researchers, planners and checkers. GSD resolves those paths only inside the project or `~/.claude/skills/`, which is why the skill is copied into the project.
+- `gsd-setup [--agents a,b,...]` (`init` runs it too): installs `.claude/skills/science-context/SKILL.md` and adds it to `.planning/config.json` `agent_skills` for the GSD researchers, planners and checkers, and for the executor, debugger and verifier, which queue a question when they hand a decision or a blocker back. GSD resolves those paths only inside the project or `~/.claude/skills/`, which is why the skill is copied into the project.
 - `export <paths…>`: for files that live outside the repo. Each one must match an absolute `export.allowed_sources` pattern, and its manifest `source` is its absolute path. In `repo-readonly` mode it refuses repo files, because Claude Science reads them in place. It is all-or-nothing and checked against `policy.json` → `export`.
 - `outbox-clean [--yes]` (only in `repo-readonly`): without `--yes`, it lists the redundant copies (`would_remove`). With `--yes`, it deletes them from `science/outbox/` and `MANIFEST.json` (`removed`). Run the dry run first and show it. Then offer to commit `science/outbox/`.
 - `compute-check`: tests from here that each `reach: claude-code` host accepts a non-interactive login.

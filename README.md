@@ -14,8 +14,8 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
 |---|---|
 | **No API.** Claude Science can't be called by another program, so results move by copy and paste. | A file handoff. Claude Science writes **findings** to `science/inbox/`, and Claude Code picks them up. A person only types one sentence in each app. |
 | **Duplicated work.** Claude Science doesn't know what the project already researched, decided or built. | Claude Science reads the **whole repo read-only** (code, `.planning/`, git history). Before every task it runs a **duplicate-work check** and builds on what exists, citing it in `builds_on`. |
-| **Lost results.** A good answer stays in a chat that the planners never see. | `ingest` routes each finding into GSD (note, todo or seed) with GSD's own `/gsd-capture`, and archives it. The injected `science-context` skill makes GSD's researcher and planner agents read and cite archived findings. |
-| **Questions don't travel.** Planning hits a gap, and nobody asks the expert. | A **question queue** (SQ-001, SQ-002 …) in `.planning/research/questions.md`. You or GSD agents add questions; Claude Science answers them; archiving ticks them off, with partial answers kept open. With **auto-consult** on, Claude Code sends new questions itself (through Claude in Chrome) at the next GSD step, even during `/gsd-autonomous`, and waits for the answer before planning on it. |
+| **Lost results.** A good answer stays in a chat that the planners never see. | `ingest` routes each finding into GSD (note, todo or seed) with GSD's own `/gsd-capture`, and archives it. The injected `science-context` skill makes GSD's researcher and planner agents read and cite archived findings, and tells the executor, debugger and verifier to queue a question when they hand a decision or a blocker back. |
+| **Questions don't travel.** Planning hits a gap, and nobody asks the expert. | A **question queue** (SQ-001, SQ-002 …) in `.planning/research/questions.md`. You or GSD agents add questions; Claude Science answers them; archiving ticks them off, with partial answers kept open. With **auto-consult** on, Claude Code sends new questions itself (through Claude in Chrome) at the next GSD step, even during `/gsd-autonomous`, and waits for the answer before planning on it. It also queues questions on its own initiative: when it hits a hard problem, and before it asks you to decide. |
 | **No cluster access.** Claude Science can't log in to clusters that need interactive multi-factor login. | **Compute handoff.** Claude Science writes a proposal with a run spec, Claude Code runs it on the cluster, and the outputs come back to `science/runs/` for Claude Science to read. |
 | **Fragile setup.** Wrong folder grants, a stale skill, a write grant that's too wide: you notice too late. | A **self-test** in Claude Science, plus `verify` in Claude Code, checks every part of the setup and says how to fix each failure. |
 
@@ -58,7 +58,7 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
 - **GSD itself is never modified.** Only its extension points are used.
 
 - **No watching needed:** after a request, Claude Code watches `science/inbox/` in the background (`wait`). When it has Chrome, it also checks Claude Science for approval prompts. It ingests when the findings arrive.
-- **Auto-consult** (opt-in, `consult on`): a PostToolUse hook reminds the session running GSD, at each step, to send new questions to Claude Science, wait for the findings and ingest them. See [Auto-consult during GSD work](#auto-consult-during-gsd-work-gsd-autonomous-included).
+- **Auto-consult** (opt-in, `consult on`): a PostToolUse hook reminds the session running GSD, at each step, to send new questions to Claude Science, wait for the findings and ingest them. The session also queues hard problems and pending owner decisions itself, and an **ask gate** holds back its first question to you once so that it checks whether to consult first. See [Auto-consult during GSD work](#auto-consult-during-gsd-work-gsd-autonomous-included).
 
 **Compute**
 - `compute` hosts in `policy.json`, each with `reach: claude-science` (Claude Science uses its own Compute target) or `reach: claude-code` (Claude Code runs the job).
@@ -224,7 +224,9 @@ GSD agents add questions to the queue and don't wait for answers. Without help, 
 - Claude Science running (`claude-science serve`).
 
 **What happens:**
-1. **A researcher or planner agent queues a question** (`SQ-NNN`) and goes on with an assumption marked "pending SQ-NNN".
+1. **A question is queued** (`SQ-NNN`), in one of two ways:
+   - a GSD agent queues it. Researchers and planners do so when they meet a gap, and go on with an assumption marked "pending SQ-NNN". Executors, debuggers and verifiers do so when they hand a decision or a blocker back;
+   - the orchestrating session queues it itself. See [Hard problems and owner decisions](#hard-problems-and-owner-decisions).
 2. **The reminder arrives at the orchestrator's next step.** The plugin's PostToolUse hook runs after every Agent, Task or Skill call. GSD makes such a call at each step, for example before the planner and before execution. When there are unsent questions or waiting findings, the hook adds a short `[science-bridge auto-consult]` reminder to the session's context. It stays silent inside subagents (they can't use the browser) and doesn't repeat an unchanged reminder for 30 minutes.
 3. **The consult round** (see the bridge skill's `consult` section):
    - ingest waiting findings with the default routes;
@@ -232,6 +234,26 @@ GSD agents add questions to the queue and don't wait for answers. Without help, 
    - watch `science/inbox/`, and handle Claude Science's approval prompts as usual, for up to `wait_minutes`;
    - ingest the answers.
 4. **Plans that rest on an answered question** (marked "pending SQ-NNN") are revised before they are executed.
+
+### Hard problems and owner decisions
+
+The hook in step 2 only sees questions that are already in the queue. Auto-consult therefore also tells the orchestrating session to queue two kinds of question on its own initiative, and to bring Claude Science's finding to you beside its own recommendation:
+- **a hard problem** that it, or an agent it spawned, could not settle with the tools at hand;
+- **a decision it is about to ask you for**, when the choice turns on research, analysis or design judgment.
+
+The question is written neutrally: every option, the evidence so far, and no recommendation. Preferences, approvals, logins and anything already settled in `.planning/` are not queued.
+
+Three things remind the session. None of them fires inside subagents:
+
+| When | What |
+|---|---|
+| Session start, `/clear`, after a compaction | A standing `[science-bridge]` line with the rule, for as long as auto-consult is on. A fresh session knows the rule even when the queue is empty. |
+| A GSD agent returns a decision checkpoint, or a blocked or inconclusive result | A `[science-bridge auto-consult]` reminder at the session's next Agent, Task or Skill call, or in the ask gate's refusal if it asks you first. Agents run in the background, so a SubagentStop hook notes the hand-back and the session is told at that next call. |
+| The session calls AskUserQuestion | **The ask gate.** The call is refused once, with the rule as the reason, together with any reminder still due (unsent questions, waiting findings, a hand-back). If the question is one for Claude Science, the session consults first and asks again, naming the SQ id. Otherwise it repeats the same call, which goes through. After a refusal the gate stays open for 30 minutes. |
+
+The ask gate costs one extra step on the first question in a while. Switch it off with `consult on --ask-gate off`, which writes `"ask_gate": false` into the `consult` block.
+
+A hook can't tell what is "hard", and it doesn't see a question the session puts to you in plain text. For those cases the rule in the session-start line and in the bridge skill is what the session follows.
 
 **Limits:**
 - **Not instant.** A question raised inside a subagent is sent at the orchestrator's next step. With `/gsd-autonomous --interactive`, plan and execute run as background agents, so the reminder arrives only at the next discuss step.
@@ -267,7 +289,7 @@ GSD agents add questions to the queue and don't wait for answers. Without help, 
 | `run <finding>` | Run a compute proposal on its host, with your OK, and commit the outputs to `science/runs/<slug>/` |
 | `status` / `check` | Show what is pending, versions and the GSD wiring / validate the inbox and outbox |
 | `wait [--timeout S]` | Block until Claude Science writes to `science/inbox/`, then report what arrived (exit 0), or time out (exit 2). Claude Code runs it in the background |
-| `consult [on\|off\|status]` | Auto-consult: `on [--wait-minutes N]` / `off` set `policy.json` → `consult`; `status` (the default) lists unsent and sent questions, waiting findings and whether Claude Science is running. `consult sent <ids>` and `consult hook` are used by the round and the hook |
+| `consult [on\|off\|status]` | Auto-consult: `on [--wait-minutes N] [--ask-gate on\|off]` / `off` set `policy.json` → `consult`; `status` (the default) lists unsent and sent questions, waiting findings and whether Claude Science is running. `consult sent <ids>` and `consult hook` are used by the round and the hook |
 | `compute-check` | Test that Claude Code can log in to each `reach: claude-code` host |
 | `gsd-setup` | Re-install the GSD `science-context` skill and `agent_skills` entries (`setup` does this too) |
 | `export <paths>` / `outbox-clean` | Copy policy-checked files from **outside** the repo into the outbox / remove old copies of repo files |
@@ -335,7 +357,8 @@ cs-skill/science-findings/      Claude Science skill (not loaded by Claude Code)
   scripts/check_finding.py      finding validator, used on both sides
   scripts/selftest.py           Claude Science self-test
 scripts/bridge.py               the deterministic CLI behind the Claude Code skill (stdlib)
-hooks/hooks.json                SessionStart hint; PostToolUse auto-consult reminder (Agent/Task/Skill)
+hooks/hooks.json                SessionStart hint; PostToolUse auto-consult reminder (Agent/Task/Skill);
+                                SubagentStop hand-back note; PreToolUse ask gate (AskUserQuestion)
 templates/                      policy.json, README.md, cs-instructions.txt, GSD science-context skill
 tests/                          python3 -m unittest discover -s tests
 ```
