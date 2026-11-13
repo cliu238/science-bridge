@@ -204,6 +204,10 @@ SKILL_ZIP_NAME = "science-findings.zip"
 MAX_HINT_LINES = 6
 SSH_TIMEOUT = 20
 
+# How queued questions reach Claude Science: "manual" (the user carries them over, or asks Claude Code to) or
+# "chrome" (Claude Code sends them itself through Claude in Chrome right after queuing them, without asking).
+# Auto-consult implies "chrome"; "chrome" alone adds none of auto-consult's hooks or ask gate.
+CONSULT_DELIVER = ("manual", "chrome")
 CONSULT_DEFAULT_WAIT = 120   # minutes a consult round waits for Claude Science before work continues
 CONSULT_MAX_WAIT = 1440
 CONSULT_REHINT_MINUTES = 30  # the hook repeats an unchanged reminder at most this often
@@ -465,6 +469,8 @@ def normalize_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
             raise BridgeError("policy.json: consult.auto must be true or false")
         if "ask_gate" in consult and not isinstance(consult["ask_gate"], bool):
             raise BridgeError("policy.json: consult.ask_gate must be true or false")
+        if "deliver" in consult and consult["deliver"] not in CONSULT_DELIVER:
+            raise BridgeError("policy.json: consult.deliver must be one of %s" % ", ".join(CONSULT_DELIVER))
         wait = consult.get("wait_minutes", CONSULT_DEFAULT_WAIT)
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= CONSULT_MAX_WAIT:
             raise BridgeError("policy.json: consult.wait_minutes must be a number from 0 to %d" % CONSULT_MAX_WAIT)
@@ -1645,6 +1651,13 @@ def cmd_ask(args: argparse.Namespace) -> int:
     out = {"ok": True, "id": new_id, "line": line, "file": rel}  # type: Dict[str, Any]
     if ws:
         out["workstream"] = ws
+    if consult_settings(policy)["deliver"] == "chrome":
+        out["deliver"] = "chrome"
+        out["next"] = ("send it now yourself, without asking the user: the consult round in the bridge skill (Claude in "
+                       "Chrome), then wait for the finding and ingest it")
+    else:
+        out["deliver"] = "manual"
+        out["next"] = "the user says \"process the open SQ requests\" in Claude Science"
     _emit(out)
     return 0
 
@@ -1935,7 +1948,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "compute_gated": {h: host_gate(root, s) for h, s in policy["compute"].items() if host_gate(root, s)},
         "requests_open": [r for r in list_requests(root, policy, ws) if r["open"]],
         "consult": {k: v for k, v in consult_report(root, policy, probe=False, ws=ws).items()
-                    if k in ("auto", "wait_minutes", "ask_gate", "unsent", "sent_awaiting")},
+                    if k in ("auto", "deliver", "wait_minutes", "ask_gate", "unsent", "sent_awaiting")},
         "selftest_pending": (root / "science" / "inbox" / SELFTEST_NAME).is_file(),
         "last_selftest": _last_selftest(root),
         **extra,
@@ -2143,12 +2156,14 @@ def _hint_requests(root: Path) -> Optional[str]:
         for r in open_requests:
             counts[r["workstream"]] = counts.get(r["workstream"], 0) + 1
         where = " by workstream: %s;" % _by_ws_text(counts)
-    if consult_settings(policy)["auto"]:
+    if consult_settings(policy)["deliver"] == "chrome":
         unsent = consult_report(root, policy, probe=False)["unsent"]
         if unsent:
-            return ("[science-bridge] auto-consult is on and %d question(s) haven't been sent to Claude Science (%s%s). "
+            return ("[science-bridge] %s %d question(s) haven't been sent to Claude Science (%s%s). "
                     "Run /science-bridge:bridge consult%s to send them through Claude in Chrome."
-                    % (len(unsent), ", ".join(u["id"] for u in unsent[:6]), ";" + where.rstrip(";") if multi else "",
+                    % ("auto-consult is on and" if consult_settings(policy)["auto"] else
+                       "Claude Code sends questions to Claude Science itself in this project, and",
+                       len(unsent), ", ".join(u["id"] for u in unsent[:6]), ";" + where.rstrip(";") if multi else "",
                        " --ws <workstream> (this session's own only)" if multi else ""))
         return ("[science-bridge] %d question(s) were sent to Claude Science and await findings; "
                 "/science-bridge:bridge consult shows them." % len(open_requests))
@@ -2323,8 +2338,10 @@ def cmd_session_hint(args: argparse.Namespace) -> int:
 
 def consult_settings(policy: Dict[str, Any]) -> Dict[str, Any]:
     block = policy.get("consult") if isinstance(policy.get("consult"), dict) else {}
-    return {"auto": block.get("auto") is True, "wait_minutes": block.get("wait_minutes", CONSULT_DEFAULT_WAIT),
-            "ask_gate": block.get("ask_gate") is not False}
+    auto = block.get("auto") is True
+    return {"auto": auto, "wait_minutes": block.get("wait_minutes", CONSULT_DEFAULT_WAIT),
+            "ask_gate": block.get("ask_gate") is not False,
+            "deliver": "chrome" if auto or block.get("deliver") == "chrome" else "manual"}
 
 
 def _consult_state_path(root: Path) -> Path:
@@ -2438,8 +2455,8 @@ def consult_report(root: Path, policy: Optional[Dict[str, Any]] = None, probe: b
         nxt = "wait for Claude Science's findings (bridge.py wait --new-only)"
     else:
         nxt = "nothing to do"
-    out = {"auto": settings["auto"], "wait_minutes": settings["wait_minutes"], "ask_gate": settings["ask_gate"],
-           "unsent": unsent,
+    out = {"auto": settings["auto"], "deliver": settings["deliver"], "wait_minutes": settings["wait_minutes"],
+           "ask_gate": settings["ask_gate"], "unsent": unsent,
            "sent_awaiting": sent, "pending_findings": pending, "next": nxt}  # type: Dict[str, Any]
     if ws_cfg is not None:
         out["workstream"] = ws
@@ -2659,6 +2676,25 @@ def cmd_consult(args: argparse.Namespace) -> int:
         return 0
     root = require_project(args.project_dir)
     policy = load_policy(root)
+    if args.action == "deliver":
+        if len(args.ids) != 1 or args.ids[0] not in CONSULT_DELIVER:
+            raise BridgeError("consult deliver takes one of: %s" % ", ".join(CONSULT_DELIVER))
+        path = root / "science" / "policy.json"
+        raw = _read_policy_raw(path)
+        block = dict(raw.get("consult")) if isinstance(raw.get("consult"), dict) else {}
+        block["deliver"] = args.ids[0]
+        new = dict(raw)
+        new["consult"] = block
+        normalize_policy(new)
+        _write_text_atomic(path, _json_pretty(new) + "\n")
+        settings = consult_settings(normalize_policy(new))
+        note = ("Claude Code now sends queued questions to Claude Science itself, through Claude in Chrome, right after "
+                "they are queued, then waits for the findings and ingests them; no per-step hooks or ask gate."
+                if settings["deliver"] == "chrome" else
+                "Queued questions wait until you say \"process the open SQ requests\" in Claude Science"
+                + (" (auto-consult is still on, so Claude Code sends them anyway)." if settings["auto"] else "."))
+        _emit({"ok": True, "consult": block, "deliver": settings["deliver"], "note": note + " Commit science/policy.json."})
+        return 0
     if args.action in ("on", "off"):
         if args.ids:
             raise BridgeError("consult %s takes no SQ ids" % args.action)
@@ -2763,7 +2799,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ws", default=None, help=ws_help)
     p = sub.add_parser("consult")
     p.add_argument("--ws", default=None, help=ws_help)
-    p.add_argument("action", nargs="?", default="status", choices=("status", "on", "off", "sent", "hook"))
+    p.add_argument("action", nargs="?", default="status", choices=("status", "on", "off", "sent", "deliver", "hook"))
     p.add_argument("ids", nargs="*", help="for `sent`: the SQ ids handed to Claude Science")
     p.add_argument("--wait-minutes", type=float, default=None,
                    help="for `on`: how long a consult round waits for findings (default %d)" % CONSULT_DEFAULT_WAIT)

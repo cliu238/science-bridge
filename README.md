@@ -215,6 +215,16 @@ Keep in mind:
 - **Claude Code never types passwords** or completes multi-factor logins for you. For example, an ssh login to a cluster with multi-factor authentication must be done by you, with `! ssh <host>` in Claude Code.
 - **Everything works without Chrome too:** do the checklist from `cs-setup` by hand, and type the requests in Claude Science yourself.
 
+## Letting Claude Code send the questions
+
+By default a queued question waits until you say "process the open SQ requests" in Claude Science, and Claude Code offers to send it for you. To have Claude Code always send it itself, through Claude in Chrome, right after it is queued, then wait for the finding and ingest it:
+
+```
+/science-bridge:bridge consult deliver chrome      # undo: consult deliver manual
+```
+
+This writes `"consult": {"deliver": "chrome"}` to `science/policy.json`; commit that file. It needs Claude Code started with Chrome and Claude Science running, like auto-consult below, but adds none of auto-consult's per-step reminders or ask gate. Auto-consult implies it.
+
 ## Auto-consult during GSD work (`/gsd-autonomous` included)
 
 GSD agents add questions to the queue and don't wait for answers. Without help, a long `/gsd-autonomous` run therefore plans everything on assumptions, and the answers come a round too late. With auto-consult on, the Claude Code session that runs GSD does the consult round itself, at the next step.

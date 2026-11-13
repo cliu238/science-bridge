@@ -41,13 +41,15 @@ Run `status` and recommend the single next step:
 - no `last_selftest`, or its `skill_version` is below `skill_version`: **cs-setup**, then the self-test;
 - `selftest_pending`: **verify**;
 - pending findings: **ingest**;
-- open requests: with `consult.auto` true and `consult.unsent` not empty, **consult**; otherwise tell the user to say "process the open SQ requests" in Claude Science, or offer **consult** to send them through Chrome;
+- open requests: with `consult.deliver` "chrome" and `consult.unsent` not empty, run the **consult** round yourself, without asking; otherwise tell the user to say "process the open SQ requests" in Claude Science, or offer **consult** to send them through Chrome;
 - `outbox.redundant` is not empty: **outbox-clean**.
 
 ## Free-text arguments
 
 If the arguments are not just a command and its options, read the user's intent. One example is `ingest 咨询一下claude science` ("ask Claude Science something").
-- **A question or task for Claude Science:** that is **ask**. Turn the text into a self-contained question, show it, and add it with `ask` once the user agrees. Then remind them to say "process the open SQ requests" in Claude Science.
+- **A question or task for Claude Science:** that is **ask**. Turn the text into a self-contained question, show it, and add it with `ask` once the user agrees. Then follow the `next` that `ask` prints:
+  - **`deliver` is "chrome":** send it yourself right away with the **consult** round (Claude in Chrome), then wait for the finding and ingest it. Don't ask the user who should deliver it; the project's setting already answered that.
+  - **`deliver` is "manual":** remind the user to say "process the open SQ requests" in Claude Science, and offer to send it through Chrome instead.
 - **Bringing results back:** that is **ingest**.
 - **Unclear:** say in one sentence what each command does and ask which one they meant.
 
@@ -192,7 +194,11 @@ Claude Science has no API, so you can't ask it whether it's done. But its result
 
 ## consult: consult Claude Science during GSD work (auto-consult)
 
-Claude Science still can't be called by a program. Auto-consult makes **you**, the session running GSD, do the round that a person used to do: send the queued questions, wait for the findings, ingest them. It is off until the user turns it on.
+Claude Science still can't be called by a program, so **you** do the round that a person used to do: send the queued questions through Claude in Chrome, wait for the findings, ingest them. Two settings in `science/policy.json` → `consult` decide when:
+- **`deliver: "chrome"`** (`consult deliver chrome`; `consult deliver manual` undoes it): run the round right after a question is queued, by `ask` or by you, and whenever `status` shows unsent questions. Don't ask the user whether to send it. Nothing else changes: no per-step hooks, no ask gate.
+- **Auto-consult** (`consult on`), which implies `deliver: "chrome"` and adds the GSD-step reminders, the ask gate and queuing questions on your own initiative. It is off until the user turns it on.
+
+If Claude in Chrome isn't available in this session or Claude Science isn't running, say so in one line and leave the questions queued. Never retry in a loop.
 
 - **Turn it on or off** only when the user asks: `consult on [--wait-minutes N] [--ask-gate on|off]` or `consult off`. It writes `"consult": {"auto": …, "wait_minutes": …}` into `science/policy.json` (default wait 120 minutes). Tell the user what it means:
   - you will drive Claude Science in Chrome on their behalf;
@@ -205,6 +211,7 @@ Claude Science still can't be called by a program. Auto-consult makes **you**, t
 - **When to run a round:**
   - a `[science-bridge auto-consult]` reminder appears in your context. A PostToolUse hook on the Agent/Task/Skill tools adds it when auto-consult is on and there are unsent questions or waiting findings. Each step of a GSD workflow calls one of these tools, so the reminder arrives before the next step: before the planner after a researcher queued something, before execution after planning;
   - you queued a question yourself (next item);
+  - `deliver` is "chrome" and a question was just queued, or `status` shows unsent ones;
   - or the user runs `consult`.
 
   The hook stays silent inside subagents and doesn't repeat an unchanged reminder for 30 minutes.

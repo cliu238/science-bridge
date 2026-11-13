@@ -381,6 +381,49 @@ class ReviewFindings(Base):
         self.assertEqual(out["next"], ["/science-bridge:bridge ingest --ws train"])
 
 
+class Deliver(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / ".planning").mkdir()
+        run(["--project-dir", str(self.root), "init"])
+
+    def cli(self, *argv):
+        return run(["--project-dir", str(self.root)] + list(argv), env={bridge.CS_CLI_ENV: "none"})
+
+    def test_default_is_manual(self):
+        code, out = self.cli("ask", "Q?")
+        self.assertEqual((out["deliver"], out["next"]), ("manual", 'the user says "process the open SQ requests" '
+                                                                   'in Claude Science'))
+        code, st = self.cli("status")
+        self.assertEqual(st["consult"]["deliver"], "manual")
+
+    def test_chrome_without_auto_consult(self):
+        code, out = self.cli("consult", "deliver", "chrome")
+        self.assertEqual((code, out["deliver"]), (0, "chrome"), out)
+        policy = json.loads((self.root / "science" / "policy.json").read_text())
+        self.assertEqual(policy["consult"], {"deliver": "chrome"})
+        code, out = self.cli("ask", "Q?")
+        self.assertEqual(out["deliver"], "chrome")
+        self.assertIn("without asking the user", out["next"])
+        self.assertIn("Claude Code sends questions to Claude Science itself", bridge._hint_requests(self.root))
+        payload = {"cwd": str(self.root), "hook_event_name": "PostToolUse", "tool_name": "Skill", "session_id": "s"}
+        self.assertIsNone(bridge.consult_hook(payload), "no auto-consult hooks")
+        code, out = self.cli("consult", "deliver", "manual")
+        self.assertEqual(out["deliver"], "manual")
+        code, out = self.cli("consult", "deliver", "pigeon")
+        self.assertEqual(code, 1)
+
+    def test_auto_consult_implies_chrome_and_policy_validates(self):
+        self.cli("consult", "on")
+        self.assertEqual(self.cli("status")[1]["consult"]["deliver"], "chrome")
+        path = self.root / "science" / "policy.json"
+        policy = json.loads(path.read_text())
+        policy["consult"]["deliver"] = "fax"
+        path.write_text(json.dumps(policy))
+        code, out = self.cli("status")
+        self.assertIn("consult.deliver", out["error"])
+
+
 class ComputeGate(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
