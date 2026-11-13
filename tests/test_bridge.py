@@ -653,9 +653,10 @@ class SessionHint(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         run(["--project-dir", str(root), "init"])
         out = self.hint(root)
-        self.assertIn("hasn't confirmed skill v%s yet" % bridge.SKILL_VERSION, out)
+        # A project without opt-in features needs only the base skill version, not the bundled one.
+        self.assertIn("hasn't confirmed skill v%s yet" % bridge.BASE_SKILL_VERSION, out)
         confirm_skill(root, "0.3.0")
-        self.assertIn("hasn't confirmed skill v%s yet" % bridge.SKILL_VERSION, self.hint(root))
+        self.assertIn("hasn't confirmed skill v%s yet" % bridge.BASE_SKILL_VERSION, self.hint(root))
         confirm_skill(root)
         self.assertEqual(self.hint(root), "")
         write_json(root / "science" / "inbox" / "selftest.json", {"format": bridge.SELFTEST_FORMAT})
@@ -737,7 +738,7 @@ class PolicyMigration(unittest.TestCase):
         for key in ("access", "do_not_read", "privacy", "team_note"):
             self.assertEqual(disk[key], V2_POLICY[key])
         self.assertEqual(disk["compute"], {})
-        self.assertEqual(disk["skill_min_version"], bridge.SKILL_VERSION)
+        self.assertEqual(disk["skill_min_version"], bridge.BASE_SKILL_VERSION)
         self.assertEqual(list(disk)[:7], ["policy_version", "access", "do_not_read", "privacy", "skill_min_version",
                                           "compute", "export"])
 
@@ -766,8 +767,8 @@ class PolicyMigration(unittest.TestCase):
         write_json(self.policy_path, policy)
         code, out = run(["--project-dir", str(self.root), "init"])
         self.assertEqual(out["policy"], "updated")
-        self.assertEqual(out["skill_min_version"], "%s (raised from 0.1.0)" % bridge.SKILL_VERSION)
-        self.assertEqual(read_json(self.policy_path)["skill_min_version"], bridge.SKILL_VERSION)
+        self.assertEqual(out["skill_min_version"], "%s (raised from 0.1.0)" % bridge.BASE_SKILL_VERSION)
+        self.assertEqual(read_json(self.policy_path)["skill_min_version"], bridge.BASE_SKILL_VERSION)
         policy["skill_min_version"] = "99.0.0"
         write_json(self.policy_path, policy)
         code, out = run(["--project-dir", str(self.root), "init"])
@@ -935,7 +936,7 @@ class ClaudeScienceSetup(unittest.TestCase):
         self.assertEqual(out["grants"], [{"path": str(root), "mode": "Read-only"},
                                          {"path": str(root / "science"), "mode": "Read & write"}])
         self.assertIn(str(root), out["instructions"])
-        self.assertIn("version %s or later" % bridge.SKILL_VERSION, out["instructions"])
+        self.assertIn("version %s or later" % bridge.BASE_SKILL_VERSION, out["instructions"])
         self.assertIn("Staging Bench", out["instructions"])
         self.assertNotIn("{{", out["instructions"])
         self.assertTrue(Path(out["skill_zip"]).is_file())

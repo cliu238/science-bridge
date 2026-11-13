@@ -40,6 +40,9 @@ SKILL_VERSION_RE = re.compile(r"^Skill version: (\d+\.\d+\.\d+)\s*$", re.MULTILI
 REQUEST_LINE_RE = re.compile(r"^- \[( |x|X)\] (SQ-(\d{3,}))\b")  # same as bridge.py
 REQUESTS_HEADING = "## For Claude Science"
 QUESTIONS_REL = ".planning/research/questions.md"
+WS_DIR_REL = ".planning/workstreams"  # same as bridge.py
+WS_QUEUE_DEFAULT = ".planning/workstreams/{ws}/questions.md"
+WS_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PROBE_REL = ".planning/PROJECT.md"
 ROOT_PROBE = ".science-bridge-write-probe"
 INBOX_PROBE = ".selftest-probe"
@@ -106,6 +109,11 @@ def read_policy(root: Path) -> Tuple[Dict[str, Any], Optional[Blocker]]:
             raise ValueError("do_not_read must be a list")
         out.update(ok=True, policy_version=raw.get("policy_version"), access=raw.get("access", "science-only"),
                    skill_min_version=raw.get("skill_min_version", "0.0.0"), do_not_read_count=len(dnr))
+        ws = raw.get("workstreams")
+        if isinstance(ws, dict) and ws.get("enabled", True) is True and isinstance(ws.get("default"), str):
+            queue = ws.get("queue", WS_QUEUE_DEFAULT)
+            out["workstreams"] = {"default": ws["default"],
+                                  "queue": queue if isinstance(queue, str) and "{ws}" in queue else WS_QUEUE_DEFAULT}
         return out, Blocker([str(p) for p in dnr])
     except Exception as e:
         out["error"] = _err(e)
@@ -238,21 +246,26 @@ def probe_write(path: Path) -> Tuple[str, Optional[str]]:
     return "error: unreachable", None
 
 
-def open_requests(root: Path, blocker: Optional[Blocker]) -> Tuple[List[str], Optional[str]]:
-    if blocker is None:
-        return [], "skipped: science/policy.json could not be read"
-    if blocker.blocked(QUESTIONS_REL):
-        return [], "skipped: %s matches do_not_read" % QUESTIONS_REL
-    try:
-        text = (root / QUESTIONS_REL).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return [], None
-    except Exception as e:
-        return [], _err(e)
+def queue_rels(root: Path, blocker: Blocker, workstreams: Optional[Dict[str, str]]) -> List[str]:
+    """The queue files: one, or with a policy.json workstreams block one per directory under
+    .planning/workstreams/ plus the default workstream (same rule as bridge.py)."""
+    if not workstreams:
+        return [QUESTIONS_REL]
+    names = set([workstreams["default"]])
+    base = root / WS_DIR_REL
+    if not blocker.blocked(WS_DIR_REL) and base.is_dir():
+        names.update(p.name for p in base.iterdir() if p.is_dir() and WS_NAME_RE.match(p.name))
+    rels = [workstreams["queue"].replace("{ws}", n) for n in sorted(names)]
+    # a shared queue from before workstreams were turned on still counts (its items belong to the default one)
+    legacy = QUESTIONS_REL not in rels and not blocker.blocked(QUESTIONS_REL) and (root / QUESTIONS_REL).is_file()
+    return rels + ([QUESTIONS_REL] if legacy else [])
+
+
+def _open_in(text: str) -> List[str]:
     lines = text.splitlines()
     start = next((i for i, line in enumerate(lines) if line.strip() == REQUESTS_HEADING), None)
     if start is None:
-        return [], None
+        return []
     out = []
     for line in lines[start + 1:]:
         if line.startswith("## "):
@@ -260,7 +273,25 @@ def open_requests(root: Path, blocker: Optional[Blocker]) -> Tuple[List[str], Op
         m = REQUEST_LINE_RE.match(line.strip())
         if m and m.group(1) == " ":
             out.append(m.group(2))
-    return out, None
+    return out
+
+
+def open_requests(root: Path, blocker: Optional[Blocker],
+                  workstreams: Optional[Dict[str, str]] = None) -> Tuple[List[str], Optional[str]]:
+    if blocker is None:
+        return [], "skipped: science/policy.json could not be read"
+    out, errors = [], []  # type: List[str], List[str]
+    for rel in queue_rels(root, blocker, workstreams):
+        if blocker.blocked(rel):
+            errors.append("skipped: %s matches do_not_read" % rel)
+            continue
+        try:
+            out.extend(_open_in((root / rel).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            errors.append("%s: %s" % (rel, _err(e)))
+    return out, ("; ".join(errors) or None)
 
 
 def parse_compute(specs: List[str], errors: List[str]) -> List[Dict[str, Any]]:
@@ -297,7 +328,7 @@ def run(root_arg: str, compute_specs: List[str], errors: List[str]) -> Dict[str,
         errors.append(cleanup)
     inbox_write = "ok" if inbox_probe == "allowed" else inbox_probe
 
-    requests, requests_error = open_requests(root, blocker)
+    requests, requests_error = open_requests(root, blocker, policy.get("workstreams"))
     return {
         "format": FORMAT,
         "created": _now(),

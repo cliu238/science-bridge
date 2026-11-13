@@ -83,7 +83,7 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
                                                                                       whole repo (read-only)
  SessionStart hint: "N findings"  ◀──  science/inbox/*.md  (validated findings)  ◀──  writes findings + attachments
  /science-bridge:bridge ingest
-   └─▶ /gsd-capture note | todo | seed ──▶ science/archive/ + routing.jsonl, SQ ticked
+   └─▶ /gsd-capture note | todo | seed ──▶ science/archive/ + routing log, SQ ticked
  /gsd-plan-phase …: agents read and cite science/archive/
 
  compute proposal (todo) ─▶ /science-bridge:bridge run ─▶ cluster ─▶ science/runs/<slug>/ ──▶ Claude Science reads results,
@@ -227,7 +227,7 @@ GSD agents add questions to the queue and don't wait for answers. Without help, 
 1. **A question is queued** (`SQ-NNN`), in one of two ways:
    - a GSD agent queues it. Researchers and planners do so when they meet a gap, and go on with an assumption marked "pending SQ-NNN". Executors, debuggers and verifiers do so when they hand a decision or a blocker back;
    - the orchestrating session queues it itself. See [Hard problems and owner decisions](#hard-problems-and-owner-decisions).
-2. **The reminder arrives at the orchestrator's next step.** The plugin's PostToolUse hook runs after every Agent, Task or Skill call. GSD makes such a call at each step, for example before the planner and before execution. When there are unsent questions or waiting findings, the hook adds a short `[science-bridge auto-consult]` reminder to the session's context. It stays silent inside subagents (they can't use the browser) and doesn't repeat an unchanged reminder for 30 minutes.
+2. **The reminder arrives at the orchestrator's next step.** The plugin's PostToolUse hook runs after every Agent, Task or Skill call. GSD makes such a call at each step, for example before the planner and before execution. When there are unsent questions or waiting findings, the hook adds a short `[science-bridge auto-consult]` reminder to the session's context. It stays silent inside subagents (they can't use the browser) and doesn't repeat an unchanged reminder to the same session for 30 minutes.
 3. **The consult round** (see the bridge skill's `consult` section):
    - ingest waiting findings with the default routes;
    - send the unsent questions to Claude Science through Chrome, and record them (`consult sent`);
@@ -260,6 +260,37 @@ A hook can't tell what is "hard", and it doesn't see a question the session puts
 - **Not fully unattended.** Claude Code approves Claude Science's prompts only within the task's scope, and asks you about credentials, writes outside the grants and anything unexpected. A finding that conflicts with a decision is never applied automatically. If it touches the phase in progress, the run stops and asks you.
 - **It falls back to the queue** when Chrome isn't connected, Claude Science isn't running, or the page changed so the browser steps fail. The questions then wait for the next round, as without auto-consult.
 - **`consult`** (status) shows what is unsent, what has been sent and awaits an answer, what is waiting in the inbox, and whether Claude Science is running.
+
+## Projects with several GSD workstreams
+
+GSD can run several workstreams in one repo (`.planning/workstreams/<ws>/`, commands with `--ws <ws>`), often one Claude Code session each. With one shared question queue, those sessions would edit the same file and route each other's findings. Opt in to per-workstream handling:
+
+```
+/science-bridge:bridge setup        # asks; or directly: bridge.py init --workstreams-default <ws>
+```
+
+This writes to `science/policy.json`:
+
+```json
+"policy_version": 4,
+"skill_min_version": "0.5.0",
+"workstreams": {"enabled": true, "default": "<ws>", "queue": ".planning/workstreams/{ws}/questions.md"}
+```
+
+What changes:
+- **Questions:** each workstream has its own queue file. `ask --ws <ws>` numbers across all of them under a lock. A shared `.planning/research/questions.md` from before keeps counting, and its items belong to `default`, so turning workstreams on loses nothing. GSD agents add items by editing their queue file directly, which takes no lock; if two collide, `status` lists the duplicate ids, `verify` fails, and a finding answering a duplicated id isn't routed until one copy is renumbered.
+- **Findings:** a finding belongs to the workstream whose questions it answers; one that answers none belongs to `default`. Each session routes only its own (`ingest`, `archive --ws <ws>`), and logs to `science/archive/routing-<ws>.jsonl`.
+- **Claude Science:** it reads every queue and writes one finding per workstream when a request spans several.
+- **GSD agents:** the installed `science-context` skill points them at their own workstream's queue.
+
+Limits:
+- `bridge.py` can't tell which workstream a session works on, so pass `--ws` (or set `$GSD_WORKSTREAM`). Without `$GSD_WORKSTREAM`, auto-consult reminders and the ask gate count every workstream's items, so a session can be reminded, or have a question held back once, because of another workstream's queue; each session acts only on its own. Start each session with `GSD_WORKSTREAM=<ws> claude` to avoid that.
+- A finding that answers questions of several workstreams can't be routed until Claude Science splits it. Until then, only the default workstream may reject it.
+- `policy_version` 4 makes science-bridge 0.6 and older refuse the policy instead of silently using one queue, and `skill_min_version` 0.5.0 does the same for older Claude Science skills. Everyone working on the repo needs science-bridge 0.7.0 or later.
+
+To record that a project's workstreams don't run as separate sessions, write `"workstreams": {"enabled": false}`. Turning workstreams off again hides the per-workstream queues, so move their open items into `.planning/research/questions.md` first.
+
+Projects without a `workstreams` block work exactly as before.
 
 ## Everyday use: what to say where
 
@@ -305,6 +336,17 @@ Declare the hosts in `science/policy.json`:
 }
 ```
 
+Two optional fields per host:
+
+```json
+"hpc": {"reach": "claude-code", "notes": "SLURM, MFA login",
+        "requires": ["handoffs/job-tooling-ready.md"],
+        "submit_via": "tools/submit.sh, which checks the allocation balance; never raw sbatch"}
+```
+
+- **`requires`:** repo paths that must exist before the host may be used. Until then the host is *gated*: `compute-check` and `verify` list it without testing it, Claude Science doesn't propose runs on it, and `run` refuses it.
+- **`submit_via`:** how jobs on the host must be submitted. Claude Science's Run spec and Claude Code's `run` use only that route.
+
 - **`claude-science`:** Claude Science runs the job through its own Compute target. This needs key-based ssh login.
 - **`claude-code`:** Claude Science writes an `analysis-proposal` with `compute: <host>` and a `### Run spec`. Ingest turns it into a GSD todo. Then:
   1. `run` asks you and executes it from Claude Code, which reuses your ssh login. If `compute-check` says you're not logged in, run `! ssh <host>` once.
@@ -324,6 +366,8 @@ Claude Code runs a cached copy of the plugin, so the `update` step is required e
 3. Run the self-test again.
 
 The session-start hint tells you when the installed plugin is older than its source.
+
+**0.7.0** adds opt-in support for [projects with several GSD workstreams](#projects-with-several-gsd-workstreams) and the `requires`/`submit_via` host fields. A project that uses neither needs no action: `setup` leaves its files unchanged, and its Claude Science skill only has to be 0.4.0 or later, so republishing is optional. From this version on, `setup` raises `skill_min_version` only to what the project's features need, not to the bundled skill version. Auto-consult reminders are now de-duplicated per Claude Code session rather than per project.
 
 ## Troubleshooting (all seen in real use)
 

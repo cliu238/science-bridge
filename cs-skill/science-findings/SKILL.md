@@ -5,7 +5,7 @@ description: Claude Science side of science-bridge (in Claude Code, use /science
 
 # science-findings: research for a software project, without duplicating its work
 
-Skill version: 0.4.0
+Skill version: 0.5.0
 
 A software project, built with Claude Code and the GSD planning system, works with you through its `science/` folder. You do the science: literature, domain-rule checks, analyses, statistics review. You write the results as **findings** in `science/inbox/`. A person then routes each finding into the project's plans. You never edit the project's code or plans.
 
@@ -16,6 +16,7 @@ A software project, built with Claude Code and the GSD planning system, works wi
    - `do_not_read`: glob patterns you must never open;
    - `skill_min_version`: if it is higher than this skill's version (above), stop. Tell the user to republish the skill and start a new session.
    - `compute`: hosts for heavy work (see Compute);
+   - `workstreams`: present when the project runs several GSD workstreams side by side (see Request queue);
    - `export`: **only** controls what Claude Code may copy into `science/outbox/`. It never limits what you may read.
 2. Read `science/README.md`, the map of the project.
 3. Read `references/format.md` in this skill, the exact finding format.
@@ -27,11 +28,12 @@ What you may read depends on `access`:
 ## Before every task: the duplicate-work check (required)
 
 Check whether the work was already done, in this order:
-1. **Earlier findings:** `science/archive/` (with `routing.jsonl`) and `science/inbox/`.
+1. **Earlier findings:** `science/archive/` (with `routing.jsonl`, or `routing-<workstream>.jsonl` per workstream) and `science/inbox/`.
 2. **The project's plans and research** in `.planning/`:
    - `PROJECT.md`, `REQUIREMENTS.md`, `ROADMAP.md`, `STATE.md`;
    - `research/`;
    - `phases/*/` (`*-RESEARCH.md`, `*-PLAN.md`, `*-SUMMARY.md`, `*-CONTEXT.md`);
+   - with GSD workstreams, the same files per workstream under `workstreams/<ws>/` (`ROADMAP.md`, `REQUIREMENTS.md`, `STATE.md`, `phases/`);
    - `notes/`, `todos/`.
 3. **The code:** search for the analysis or rule. Is it already implemented, tested, or decided against?
 4. **Recent history:** `git log --oneline -30`, plus `git log -S <keyword>` when useful.
@@ -44,7 +46,9 @@ Then decide:
 
 ## Request queue ("process the open requests")
 
-Open questions for you live in `.planning/research/questions.md`, under `## For Claude Science`, as lines like `- [ ] SQ-007 (...): question — context: ...; affects: ...`.
+Open questions for you live under `## For Claude Science`, as lines like `- [ ] SQ-007 (...): question — context: ...; affects: ...`. Where:
+- **Usually** in `.planning/research/questions.md`.
+- **With a `workstreams` block in `policy.json`:** one queue per GSD workstream, at the `workstreams.queue` path with `{ws}` replaced by each directory name under `.planning/workstreams/` (default `.planning/workstreams/{ws}/questions.md`), plus `.planning/research/questions.md` if it exists, whose items belong to `workstreams.default`. SQ numbers are unique across all of them. Each workstream is worked by its own Claude Code session, which routes only the findings that answer its own items. So **one finding answers items of one workstream only**: when a request spans workstreams, write one finding per workstream. A finding that answers no queued item goes to `workstreams.default`.
 
 When asked to process them:
 - List the open items (`- [ ]`) to the user first.
@@ -58,6 +62,8 @@ When asked to process them:
 
 Look up the host in `policy.json` → `compute`:
 - **`"reach": "claude-science"`:** use your Compute target with that name.
+- **`"requires"`** (a list of repo paths): the host isn't usable until every one of them exists. If one is missing, don't propose runs on it; say what it waits for.
+- **`"submit_via"`**: how jobs on that host must be submitted, for example a project command that checks a compute budget. A Run spec for that host submits only that way, never with a raw scheduler command.
 - **`"reach": "claude-code"`** (for example, login nodes that need interactive multi-factor login): don't connect yourself. Write an `analysis-proposal` with `compute: <host>` in its frontmatter, and a `### Run spec` subsection under `## Suggested action` that gives:
   - what to run: script or commands, with environment or modules;
   - inputs: repo paths;

@@ -74,6 +74,14 @@ Commands:
                                     rule while auto-consult is on; otherwise print nothing.
                                     Always exits 0.
 
+Workstreams (opt-in, `init --workstreams-default WS`): in a GSD project whose workstreams run as separate
+sessions, each workstream keeps its own queue (policy.json workstreams.queue), SQ numbers stay unique across
+them, a finding belongs to the workstream whose items it answers (else workstreams.default), and status, ask,
+requests, archive and consult act for the workstream named by --ws (or $GSD_WORKSTREAM).
+
+Compute hosts may carry `requires` (repo paths that must exist before the host is used; until then it is
+gated) and `submit_via` (the only way jobs on it may be submitted).
+
 Every command except init and skill-zip locates the project by walking up from --project-dir
 (default: $CLAUDE_PROJECT_DIR or the current directory) to the first directory that
 contains science/policy.json.
@@ -147,6 +155,16 @@ REQUESTS_COMMENT = ("<!-- Request queue for Claude Science (science-bridge). One
                     "     Check for an existing item before adding. Claude Science answers with a finding that has\n"
                     "     `answers: [SQ-NNN]`; `bridge.py archive` ticks the item. -->")
 REQUEST_LINE_RE = re.compile(r"^- \[( |x|X)\] (SQ-(\d{3,}))\b(.*)$")
+# Projects with several GSD workstreams (one Claude Code session per workstream) opt in with a policy.json
+# "workstreams" block: each workstream keeps its own queue file, SQ numbers stay unique across all of them, and a
+# finding belongs to the workstream whose items it answers (findings that answer none belong to the default one).
+WS_DIR_REL = ".planning/workstreams"
+WS_QUEUE_DEFAULT = ".planning/workstreams/{ws}/questions.md"
+WS_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+WS_ENV = "GSD_WORKSTREAM"
+QUEUE_LOCK_REL = "science/.cache/queue.lock"
+CONSULT_LOCK_REL = "science/.cache/consult.lock"
+ROUTING_LOG = "routing.jsonl"
 MANIFEST_FORMAT = "science-bridge-manifest/v0.1"
 PRIVACY_LEVELS = ("phi", "confidential", "public")
 ACCESS_MODES = ("repo-readonly", "science-only")
@@ -159,7 +177,14 @@ SELFTEST_LATEST = "selftest-latest.json"
 SELFTEST_FORMAT = "science-bridge-selftest/v1"
 INBOX_IGNORED = {".gitkeep", "README.md", SELFTEST_NAME, ".selftest-probe"}
 
-POLICY_VERSION = 3
+POLICY_VERSION = 3        # what init writes and migrates older policies to
+WS_POLICY_VERSION = 4     # a policy with workstreams on: older science-bridge versions refuse it instead of
+POLICY_VERSION_MAX = 4    # silently using one shared queue
+# The Claude Science skill version each feature needs. init raises skill_min_version only to what the project
+# uses, so a skill release that adds an opt-in feature doesn't make every project republish the skill. Raise
+# BASE_SKILL_VERSION when a skill change must reach every project.
+BASE_SKILL_VERSION = "0.4.0"
+WS_SKILL_VERSION = "0.5.0"
 EXPORT_DEFAULTS = (("allowed_sources", []), ("allowed_extensions", []), ("check_command", None), ("max_file_mb", 50))
 EXPORT_KEYS = tuple(k for k, _ in EXPORT_DEFAULTS)
 COMPUTE_REACH = ("claude-code", "claude-science")
@@ -289,6 +314,13 @@ def _render(template: str, **values: str) -> str:
     return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), m.group(0)), template)
 
 
+def _safe_rel(rel: str) -> bool:
+    """A non-empty repo-relative path that stays inside the repo."""
+    if not rel or os.path.isabs(rel) or rel.startswith("~"):
+        return False
+    return ".." not in Path(rel).parts
+
+
 def _out_path(arg: Optional[str]) -> Optional[Path]:
     if not arg:
         return None
@@ -341,7 +373,7 @@ def normalize_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
         version_num = version
     else:
         raise BridgeError("policy.json: policy_version must be an integer")
-    if version_num > POLICY_VERSION:
+    if version_num > POLICY_VERSION_MAX:
         raise BridgeError("policy.json: policy_version %d is newer than this science-bridge (v%s) understands; "
                           "update the plugin" % (version_num, PLUGIN_VERSION))
     legacy = version_num < POLICY_VERSION
@@ -389,8 +421,35 @@ def normalize_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
                               % (host, HOST_RE.pattern))
         if not isinstance(spec, dict) or spec.get("reach") not in COMPUTE_REACH:
             raise BridgeError("policy.json: compute.%s.reach must be one of %s" % (host, ", ".join(COMPUTE_REACH)))
-        if "notes" in spec and not isinstance(spec["notes"], str):
-            raise BridgeError("policy.json: compute.%s.notes must be a string" % host)
+        for key in ("notes", "submit_via"):
+            if key in spec and not isinstance(spec[key], str):
+                raise BridgeError("policy.json: compute.%s.%s must be a string" % (host, key))
+        if "requires" in spec:
+            req = spec["requires"]
+            if not isinstance(req, list) or not all(isinstance(r, str) and _safe_rel(r) for r in req):
+                raise BridgeError("policy.json: compute.%s.requires must be a list of repo-relative paths" % host)
+    workstreams = policy.get("workstreams")
+    if version_num == WS_POLICY_VERSION and workstreams is None:
+        raise BridgeError("policy.json: policy_version %d is newer than v%d and only for a policy with a workstreams "
+                          "block; without one, use %d" % (WS_POLICY_VERSION, POLICY_VERSION, POLICY_VERSION))
+    if workstreams is not None:
+        if not isinstance(workstreams, dict):
+            raise BridgeError("policy.json: workstreams must be an object like {\"enabled\": true, \"default\": "
+                              "\"<workstream>\"}")
+        if "enabled" in workstreams and not isinstance(workstreams["enabled"], bool):
+            raise BridgeError("policy.json: workstreams.enabled must be true or false")
+        default = workstreams.get("default")
+        if workstreams.get("enabled", True) and not (isinstance(default, str) and WS_NAME_RE.match(default)):
+            raise BridgeError("policy.json: workstreams.default must name the workstream that owns findings which "
+                              "answer no queued question (letters, digits, '.', '_', '-')")
+        if workstreams.get("enabled", True) and version_num < WS_POLICY_VERSION:
+            raise BridgeError("policy.json: workstreams need policy_version %d, so that science-bridge versions "
+                              "without workstream support refuse this policy instead of sharing one queue"
+                              % WS_POLICY_VERSION)
+        queue = workstreams.get("queue", WS_QUEUE_DEFAULT)
+        if not (isinstance(queue, str) and "{ws}" in queue and _safe_rel(queue)):
+            raise BridgeError("policy.json: workstreams.queue must be a repo-relative path containing {ws}, e.g. %s"
+                              % WS_QUEUE_DEFAULT)
     policy.setdefault("skill_min_version", "0.0.0")
     if not isinstance(policy["skill_min_version"], str) or not VERSION_RE.match(policy["skill_min_version"]):
         raise BridgeError("policy.json: skill_min_version must look like 0.4.0")
@@ -426,6 +485,113 @@ def policy_as_v3(raw: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
         if key not in out and key not in EXPORT_KEYS:
             out[key] = value
     return out
+
+
+# ---------------------------------------------------------------- workstreams
+
+def ws_settings(policy: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """{"default", "queue"} when the policy turns workstreams on, else None (one queue, one owner)."""
+    block = policy.get("workstreams")
+    if not isinstance(block, dict) or block.get("enabled", True) is not True:
+        return None
+    return {"default": block["default"], "queue": block.get("queue", WS_QUEUE_DEFAULT)}
+
+
+def required_skill_version(policy: Dict[str, Any]) -> str:
+    """The lowest Claude Science skill version that supports every feature this policy uses."""
+    return WS_SKILL_VERSION if ws_settings(policy) is not None else BASE_SKILL_VERSION
+
+
+def workstream_dirs(root: Path) -> List[str]:
+    """The GSD workstreams of this project: the directories under .planning/workstreams/."""
+    base = root / WS_DIR_REL
+    if not base.is_dir():
+        return []
+    return sorted(p.name for p in base.iterdir() if p.is_dir() and WS_NAME_RE.match(p.name))
+
+
+def workstream_names(root: Path, policy: Dict[str, Any]) -> List[str]:
+    settings = ws_settings(policy)
+    if settings is None:
+        return []
+    names = workstream_dirs(root)
+    if settings["default"] not in names:
+        names = sorted(names + [settings["default"]])
+    return names
+
+
+def queue_rel(policy: Dict[str, Any], ws: Optional[str]) -> str:
+    settings = ws_settings(policy)
+    if settings is None or ws is None:
+        return QUESTIONS_REL
+    return settings["queue"].replace("{ws}", ws)
+
+
+def queue_files(root: Path, policy: Dict[str, Any]) -> List[Tuple[Optional[str], str]]:
+    """(workstream, repo-relative queue path) for every queue; workstream is None without workstreams. With
+    workstreams, a shared queue left from before they were turned on still counts: its items belong to the
+    default workstream, so they are neither lost nor renumbered."""
+    settings = ws_settings(policy)
+    if settings is None:
+        return [(None, QUESTIONS_REL)]
+    out = [(ws, queue_rel(policy, ws)) for ws in workstream_names(root, policy)]  # type: List[Tuple[Optional[str], str]]
+    if (root / QUESTIONS_REL).is_file() and QUESTIONS_REL not in [rel for _, rel in out]:
+        out.append((settings["default"], QUESTIONS_REL))
+    return out
+
+
+def resolve_ws(root: Path, policy: Dict[str, Any], arg: Optional[str], required: bool) -> Optional[str]:
+    """The workstream a command acts for: --ws, else $GSD_WORKSTREAM. None without workstreams."""
+    settings = ws_settings(policy)
+    if settings is None:
+        if arg:
+            raise BridgeError("--ws %s: this project has no workstreams block in science/policy.json; drop --ws" % arg)
+        return None
+    names = workstream_names(root, policy)
+    ws = arg or os.environ.get(WS_ENV) or None
+    if not ws:
+        if required:
+            raise BridgeError("this project works in GSD workstreams (%s); pass --ws <workstream>, the one this "
+                              "session works on" % ", ".join(names))
+        return None
+    if ws not in names:
+        raise BridgeError("unknown workstream %r; this project has %s" % (ws, ", ".join(names)))
+    return ws
+
+
+def routing_log_name(ws: Optional[str]) -> str:
+    """Each workstream appends to its own log, so two sessions never hold edits to one file."""
+    return ROUTING_LOG if ws is None else "routing-%s.jsonl" % ws
+
+
+class _Lock:
+    """An exclusive lock (science/.cache/*.lock) around a read-modify-write that sessions sharing one checkout may run
+    at the same time: taking an SQ number, updating consult.json. A no-op where fcntl is missing (Windows)."""
+
+    def __init__(self, root: Path, rel: Optional[str] = None):
+        self.path = root / (rel or QUEUE_LOCK_REL)
+        self.fd = None  # type: Any
+
+    def __enter__(self) -> "_Lock":
+        try:
+            import fcntl
+        except ImportError:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = open(str(self.path), "a")
+        fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self.fd is not None:
+            import fcntl
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+            self.fd.close()
+
+
+def host_gate(root: Path, spec: Dict[str, Any]) -> List[str]:
+    """The `requires` paths of a compute host that don't exist yet; the host isn't usable until they do."""
+    return [r for r in spec.get("requires") or [] if not (root / r).exists()]
 
 
 def load_manifest(root: Path) -> Dict[str, Any]:
@@ -468,11 +634,12 @@ def init_policy(root: Path) -> Tuple[str, Optional[str], bool]:
         status = "migrated v%s→v%d" % (raw.get("policy_version") or 1, POLICY_VERSION)
     old_min = policy["skill_min_version"]
     note = old_min
-    if vtuple(SKILL_VERSION) > vtuple(old_min):
+    need = required_skill_version(policy)
+    if vtuple(need) > vtuple(old_min):
         if new is raw:
             new = dict(raw)
-        new["skill_min_version"] = SKILL_VERSION
-        note = "%s (raised from %s)" % (SKILL_VERSION, old_min)
+        new["skill_min_version"] = need
+        note = "%s (raised from %s)" % (need, old_min)
         status = status or "updated"
     if new is not raw:
         normalize_policy(new)
@@ -594,6 +761,38 @@ def _unique_path(path: Path) -> Path:
     return path.with_name("%s%d" % (path.name, n))
 
 
+README_QUEUE_CELL = "`.planning/research/questions.md` → `## For Claude Science` (SQ-NNN items)"
+README_ROUTING_CELL = "`science/archive/`, with `science/archive/routing.jsonl`"
+CS_QUEUE_SENTENCE = ('Open requests for you are the SQ items in .planning/research/questions.md under '
+                     '"## For Claude Science".')
+CS_COMPUTE_SENTENCE = 'Write an analysis-proposal with a "### Run spec" instead, and Claude Code will run it.'
+
+
+def _ws_layout(root: Path) -> Optional[Dict[str, str]]:
+    """Where the queues and routing logs are when workstreams are on; None otherwise (the templates' own text,
+    unchanged, describes the single queue)."""
+    try:
+        policy = load_policy(root)
+    except BridgeError:
+        return None
+    settings = ws_settings(policy)
+    if settings is None:
+        return None
+    return {"queue": settings["queue"], "default": settings["default"]}
+
+
+def _readme_layout(text: str, root: Path) -> str:
+    layout = _ws_layout(root)
+    if layout is None:
+        return text
+    text = text.replace(README_QUEUE_CELL, "one file per GSD workstream, `%s` for each directory under "
+                        "`.planning/workstreams/`, plus `.planning/research/questions.md` if it exists (its items "
+                        "belong to `%s`) → `## For Claude Science` (SQ-NNN items, numbered across all of them)"
+                        % (layout["queue"], layout["default"]))
+    return text.replace(README_ROUTING_CELL, "`science/archive/`, with `science/archive/routing-<workstream>.jsonl`"
+                        " (and `routing.jsonl` from before workstreams)")
+
+
 def sync_readme(root: Path) -> Tuple[str, Optional[str]]:
     """Create science/README.md, refresh its managed block, or migrate a legacy README.
     Returns (status, backup path of a migrated legacy README or None)."""
@@ -601,14 +800,15 @@ def sync_readme(root: Path) -> Tuple[str, Optional[str]]:
     tpl_parts = _split_managed(template)
     dst = root / "science" / "README.md"
     if not dst.exists():
-        dst.write_text(_render(template, project_name=_project_name(root), brief=auto_brief(root)), encoding="utf-8")
+        dst.write_text(_readme_layout(_render(template, project_name=_project_name(root), brief=auto_brief(root)),
+                                      root), encoding="utf-8")
         return "created", None
     old = dst.read_text(encoding="utf-8")
     parts = _split_managed(old)
     if parts is not None:
         if tpl_parts is None:
             return "unchanged", None
-        new = parts[0] + _render(tpl_parts[1], project_name=_project_name(root)) + parts[2]
+        new = parts[0] + _readme_layout(_render(tpl_parts[1], project_name=_project_name(root)), root) + parts[2]
         if new == old:
             return "unchanged", None
         _write_text_atomic(dst, new)
@@ -617,8 +817,39 @@ def sync_readme(root: Path) -> Tuple[str, Optional[str]]:
     brief = _legacy_brief(old) or auto_brief(root)
     backup = _unique_path(dst.with_name("README.md.bak"))
     shutil.copyfile(str(dst), str(backup))
-    _write_text_atomic(dst, _render(template, project_name=name, brief=brief))
+    _write_text_atomic(dst, _readme_layout(_render(template, project_name=name, brief=brief), root))
     return "migrated-legacy", str(backup.relative_to(root))
+
+
+def _enable_workstreams(root: Path, default: str) -> str:
+    """Write {"enabled": true, "default": DEFAULT} into policy.json (keeping a custom queue pattern)."""
+    if not WS_NAME_RE.match(default):
+        raise BridgeError("--workstreams-default %r is not a valid workstream name" % default)
+    names = workstream_dirs(root)
+    if default not in names:
+        raise BridgeError("--workstreams-default %s: no such workstream under %s (found: %s)"
+                          % (default, WS_DIR_REL, ", ".join(names) or "none"))
+    path = root / "science" / "policy.json"
+    raw = _read_policy_raw(path)
+    block = dict(raw.get("workstreams")) if isinstance(raw.get("workstreams"), dict) else {}
+    before = dict(block)
+    block["enabled"] = True
+    block["default"] = default
+    block.setdefault("queue", WS_QUEUE_DEFAULT)
+    version = raw.get("policy_version")
+    old_min = raw.get("skill_min_version") if isinstance(raw.get("skill_min_version"), str) else "0.0.0"
+    if (block == before and isinstance(version, int) and version >= WS_POLICY_VERSION
+            and vtuple(old_min) >= vtuple(WS_SKILL_VERSION)):
+        return "workstreams on (default %s), unchanged" % default
+    new = dict(raw)
+    new["policy_version"] = max(WS_POLICY_VERSION, version if isinstance(version, int) else 0)
+    if vtuple(WS_SKILL_VERSION) > vtuple(old_min):
+        new["skill_min_version"] = WS_SKILL_VERSION
+    new["workstreams"] = block
+    normalize_policy(new)
+    _write_text_atomic(path, _json_pretty(new) + "\n")
+    return "workstreams on: %s; queues at %s; findings that answer no queued question belong to %s" % (
+        ", ".join(workstream_names(root, normalize_policy(new))), block["queue"], default)
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -640,6 +871,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     policy_status, min_version, policy_ok = init_policy(root)
     if policy_status == "created":
         created.append("science/policy.json")
+    ws_note = None  # type: Optional[str]
+    if policy_ok and args.workstreams_default:
+        ws_note = _enable_workstreams(root, args.workstreams_default)
+    elif policy_ok and workstream_dirs(root) and "workstreams" not in _read_policy_raw(root / "science" / "policy.json"):
+        ws_note = ("This project has GSD workstreams (%s) but science/policy.json has no workstreams block, so all of "
+                   "them share one question queue and one owner. If they run as separate sessions, run init again "
+                   "with --workstreams-default <name> (the workstream that owns findings which answer no queued "
+                   "question); if not, add \"workstreams\": {\"enabled\": false} to science/policy.json to record that."
+                   % ", ".join(workstream_dirs(root)))
     readme_status, readme_backup = sync_readme(root)
     if readme_status == "created":
         created.append("science/README.md")
@@ -660,6 +900,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     if readme_backup:
         next_steps.insert(2, "Your old science/README.md is kept at %s; move anything still needed into the "
                              "Project brief, then delete it." % readme_backup)
+    if ws_note and not args.workstreams_default:
+        next_steps.insert(0, ws_note)
     redundant = []  # type: List[Dict[str, str]]
     if policy_ok:
         try:
@@ -680,6 +922,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     }  # type: Dict[str, Any]
     if readme_backup:
         out["readme_backup"] = readme_backup
+    if ws_note:
+        out["workstreams"] = ws_note
     out["gsd"] = gsd if gsd is not None else "skipped (no .planning/config.json or --no-gsd)"
     out["outbox_redundant"] = redundant
     out["next_steps"] = next_steps
@@ -729,6 +973,17 @@ def cmd_cs_setup(args: argparse.Namespace) -> int:
         grants = [{"path": str(sci), "mode": "Read & write"}]
     instructions = _render((TEMPLATES / "cs-instructions.txt").read_text(encoding="utf-8"),
                            project_name=name, root=str(root), skill_min_version=policy["skill_min_version"])
+    layout = _ws_layout(root)
+    if layout is not None:
+        instructions = instructions.replace(CS_QUEUE_SENTENCE, (
+            'Open requests for you are the SQ items under "## For Claude Science" in the queue files %s, one for '
+            'each GSD workstream directory under .planning/workstreams/, plus .planning/research/questions.md if it '
+            'exists (its items belong to workstream %s). A finding answers items of one workstream only, so write '
+            'separate findings when a request spans several.' % (layout["queue"], layout["default"])))
+    if any("requires" in s or "submit_via" in s for s in policy["compute"].values()):
+        instructions = instructions.replace(CS_COMPUTE_SENTENCE, CS_COMPUTE_SENTENCE + (
+            ' A host whose "requires" paths don\'t exist yet is not usable: don\'t propose runs on it. Where a host '
+            'has "submit_via", the Run spec submits only that way.'))
     if policy["access"] == "science-only":
         instructions = re.sub(r"(?m)^Read access:.*$",
                               "Read access (access: science-only): only the files listed in "
@@ -760,9 +1015,10 @@ def cmd_cs_setup(args: argparse.Namespace) -> int:
     warnings = []
     if policy["_legacy"]:
         warnings.append("science/policy.json is a legacy policy; run /science-bridge:bridge init first.")
-    if vtuple(policy["skill_min_version"]) < vtuple(skill["skill_version"]):
-        warnings.append("policy.json skill_min_version %s is below the bundled skill v%s; run /science-bridge:bridge "
-                        "init to raise it." % (policy["skill_min_version"], skill["skill_version"]))
+    if vtuple(policy["skill_min_version"]) < vtuple(required_skill_version(policy)):
+        warnings.append("policy.json skill_min_version %s is below v%s, which this project's features need; run "
+                        "/science-bridge:bridge init to raise it." % (policy["skill_min_version"],
+                                                                      required_skill_version(policy)))
     _emit({
         "ok": True,
         "project": str(root),
@@ -808,8 +1064,10 @@ def ssh_check(host: str) -> Tuple[bool, str]:
     return False, "`ssh %s true` exited %d%s" % (host, proc.returncode, (": " + tail[0]) if tail else "")
 
 
-def compute_checks(policy: Dict[str, Any], selftest: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """claude-code hosts: ssh from here. claude-science hosts (only with a self-test): its reported result."""
+def compute_checks(policy: Dict[str, Any], selftest: Optional[Dict[str, Any]] = None,
+                   root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """claude-code hosts: ssh from here. claude-science hosts (only with a self-test): its reported result.
+    A host whose `requires` paths are missing is gated: not tested, not a failure, and not usable for runs."""
     reported = {}  # type: Dict[str, Dict[str, Any]]
     if selftest is not None:
         entries = selftest.get("compute")
@@ -820,6 +1078,13 @@ def compute_checks(policy: Dict[str, Any], selftest: Optional[Dict[str, Any]] = 
     for host in sorted(policy["compute"]):
         spec = policy["compute"][host]
         notes = spec.get("notes")
+        missing = host_gate(root, spec) if root is not None else []
+        if missing:
+            check = _check("compute:%s" % host, True, "gated, not tested: waits for %s; no runs on %s until then"
+                           % (", ".join(missing), host))
+            check["gated"] = missing
+            checks.append(check)
+            continue
         if spec["reach"] == "claude-code":
             ok, detail = ssh_check(host)
             checks.append(_check("compute:%s" % host, ok, "from Claude Code: %s" % detail,
@@ -940,7 +1205,7 @@ def _repo_checks(root: Path, policy: Dict[str, Any], data: Dict[str, Any]) -> Li
         if data.get("requests_error"):
             detail += " (self-test: %s)" % data["requests_error"]
         checks.append(_check("requests_open", cs_set == local_set, detail,
-                             "If %s changed after the self-test, run it again; otherwise %s" % (QUESTIONS_REL, fix_repo)))
+                             "If a question queue changed after the self-test, run it again; otherwise %s" % fix_repo))
     return checks
 
 
@@ -993,7 +1258,12 @@ def selftest_checks(root: Path, policy: Dict[str, Any], data: Dict[str, Any], ma
     inbox = data.get("inbox_write")
     checks.append(_check("inbox_write", inbox == "ok", "writing science/inbox/ from Claude Science: %s" % inbox,
                          FIX_INBOX % sci))
-    checks.extend(compute_checks(policy, data))
+    if ws_settings(policy) is not None:
+        dups = duplicate_ids(root, policy)
+        checks.append(_check("sq_ids_unique", not dups, "SQ ids used by more than one queue: %s" % (
+            "; ".join("%s in %s" % (k, ", ".join(v)) for k, v in sorted(dups.items())) or "none"),
+            "Renumber each duplicate in one of its queues to the next free number across all queues."))
+    checks.extend(compute_checks(policy, data, root))
     return checks
 
 
@@ -1033,9 +1303,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def cmd_compute_check(args: argparse.Namespace) -> int:
     root = require_project(args.project_dir)
     policy = load_policy(root)
-    checks = compute_checks(policy, None)
+    checks = compute_checks(policy, None, root)
     ok = all(c["ok"] for c in checks)
     out = {"ok": ok, "checks": checks}  # type: Dict[str, Any]
+    gated = [c["name"].split(":", 1)[1] for c in checks if c.get("gated")]
+    if gated:
+        out["gated"] = gated
+        out["note"] = "gated hosts can't be used for runs yet; `run` must refuse them"
     if not checks:
         out["note"] = "policy.json compute has no host with reach \"claude-code\""
     _emit(out)
@@ -1056,11 +1330,43 @@ def _last_selftest(root: Path) -> Optional[Dict[str, Any]]:
 
 # ---------------------------------------------------------------- GSD integration
 
+GSD_WS_EDITS = (
+    ("(template science-context v5)", "(template science-context v5, workstreams)"),
+    ("1. **Read `science/archive/routing.jsonl`.** It has",
+     "1. **Read `science/archive/routing-*.jsonl`** (one log per GSD workstream; also `routing.jsonl` if present). "
+     "Each has"),
+    ("1. Open `.planning/research/questions.md` and find the `## For Claude Science` section. If it is missing, add "
+     "it at the end of the file.",
+     "1. Open your workstream's queue, `{queue}`, where `<ws>` is the workstream you work for (the `--ws` of the GSD "
+     "command that spawned you; the workstream directory your phase files live in). Find the `## For Claude "
+     "Science` section. If the file or the section is missing, create it. Never edit another workstream's queue."),
+    ("3. Append one line at the end of that section. Use the next free number:",
+     "3. Append one line at the end of that section. Use the next free number across every workstream's queue "
+     "(`{glob}`, and `.planning/research/questions.md` if it exists), so SQ numbers stay unique in the project:"),
+)
+
+
+def gsd_skill_bytes(root: Path) -> bytes:
+    """The science-context skill for this project: the template itself, or with workstreams on, the template with
+    the queue and routing-log sentences pointed at the per-workstream files."""
+    data = GSD_SKILL_TEMPLATE.read_bytes()
+    layout = _ws_layout(root)
+    if layout is None:
+        return data
+    text = data.decode("utf-8")
+    queue = layout["queue"].replace("{ws}", "<ws>")
+    for old, new in GSD_WS_EDITS:
+        if old not in text:
+            raise BridgeError("science-context template changed; update GSD_WS_EDITS (%r)" % old[:40])
+        text = text.replace(old, new.replace("{queue}", queue).replace("{glob}", layout["queue"].replace("{ws}", "*")))
+    return text.encode("utf-8")
+
+
 def _gsd_skill_state(root: Path) -> str:
     dst = root / GSD_SKILL_ENTRY / "SKILL.md"
     if not dst.is_file():
         return "missing"
-    return "current" if dst.read_bytes() == GSD_SKILL_TEMPLATE.read_bytes() else "outdated"
+    return "current" if dst.read_bytes() == gsd_skill_bytes(root) else "outdated"
 
 
 def gsd_report(root: Path) -> Dict[str, Any]:
@@ -1097,7 +1403,7 @@ def gsd_setup(root: Path, agents: List[str]) -> Dict[str, Any]:
     state = _gsd_skill_state(root)
     if state != "current":
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(str(GSD_SKILL_TEMPLATE), str(dst))
+        dst.write_bytes(gsd_skill_bytes(root))
     skill_status = {"missing": "installed", "outdated": "updated", "current": "unchanged"}[state]
 
     skills = cfg.get("agent_skills")
@@ -1126,22 +1432,31 @@ def gsd_setup(root: Path, agents: List[str]) -> Dict[str, Any]:
             verified = GSD_SKILL_ENTRY + "/SKILL.md" in proc.stdout
         except (OSError, subprocess.TimeoutExpired):
             verified = None
-    section_added = ensure_requests_section(root)
+    try:
+        policy = load_policy(root) if (root / "science" / "policy.json").is_file() else {}
+    except BridgeError:
+        policy = {}
+    if ws_settings(policy) is not None:
+        # Each workstream's queue is created by its own session on its first `ask`, so setup never writes into
+        # another workstream's directory.
+        requests_section = "%s, one per workstream (each created on its first ask)" % ws_settings(policy)["queue"]
+    else:
+        section_added = ensure_requests_section(root)
+        requests_section = "%s (%s)" % (QUESTIONS_REL, "added" if section_added else "present")
     return {"skill": "%s/SKILL.md (%s)" % (GSD_SKILL_ENTRY, skill_status), "agents_added": added,
-            "requests_section": "%s (%s)" % (QUESTIONS_REL, "added" if section_added else "present"),
-            "agents": agents, "gsd_sdk_verified": verified}
+            "requests_section": requests_section, "agents": agents, "gsd_sdk_verified": verified}
 
 
 def _questions_path(root: Path) -> Path:
     return root / QUESTIONS_REL
 
 
-def ensure_requests_section(root: Path) -> bool:
-    """Create .planning/research/questions.md and/or its "For Claude Science" section. True if changed."""
+def ensure_requests_section(root: Path, rel: str = QUESTIONS_REL, title: str = "# Open Research Questions") -> bool:
+    """Create the queue file REL and/or its "For Claude Science" section. True if changed."""
     if not (root / ".planning").is_dir():
         return False
-    path = _questions_path(root)
-    text = path.read_text(encoding="utf-8") if path.is_file() else "# Open Research Questions\n"
+    path = root / rel
+    text = path.read_text(encoding="utf-8") if path.is_file() else title + "\n"
     if any(line.strip() == REQUESTS_HEADING for line in text.splitlines()):
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1158,22 +1473,74 @@ def _section_bounds(lines: List[str]) -> Optional[range]:
     return range(start + 1, end)
 
 
-def list_requests(root: Path) -> List[Dict[str, Any]]:
-    path = _questions_path(root)
+def _parse_queue(path: Path) -> List[Dict[str, Any]]:
     if not path.is_file():
         return []
     lines = path.read_text(encoding="utf-8").splitlines()
-    bounds = _section_bounds(lines)
     out = []
-    for i in (bounds or []):
+    for i in (_section_bounds(lines) or []):
         m = REQUEST_LINE_RE.match(lines[i].strip())
         if m:
             out.append({"id": m.group(2), "open": m.group(1) == " ", "text": m.group(4).strip()})
     return out
 
 
-def tick_requests(root: Path, ids: List[str], answered_by: str) -> Dict[str, List[str]]:
-    path = _questions_path(root)
+def list_requests(root: Path, policy: Optional[Dict[str, Any]] = None,
+                  ws: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every SQ item, from every queue. With workstreams each item carries its `workstream` and `file`; WS keeps
+    only that workstream's items."""
+    if policy is None:
+        try:
+            policy = load_policy(root)
+        except BridgeError:
+            policy = {}
+    out = []
+    for name, rel in queue_files(root, policy):
+        if ws is not None and name != ws:
+            continue
+        for item in _parse_queue(root / rel):
+            if name is not None:
+                item["workstream"] = name
+                item["file"] = rel
+            out.append(item)
+    return out
+
+
+def finding_owner(root: Path, policy: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """(workstream, problem) of a finding. The owner is the workstream whose queue holds the items it answers; a
+    finding that answers no queued item belongs to the default workstream. Without workstreams: (None, None)."""
+    settings = ws_settings(policy)
+    if settings is None:
+        return None, None
+    answers = [str(a) for a in meta.get("answers")] if isinstance(meta.get("answers"), list) else []
+    where = {}  # type: Dict[str, List[str]]
+    for r in list_requests(root, policy):
+        where.setdefault(r["id"], []).append(r["workstream"])
+    clashes = ["%s (%s)" % (a, ", ".join(sorted(set(where[a]))) if len(set(where[a])) > 1 else
+                            "twice in %s's queue" % where[a][0]) for a in answers if len(where.get(a, [])) > 1]
+    if clashes:
+        return None, ("answers %s, an id used by more than one queue item; renumber the duplicate item in one queue (the "
+                      "next free number across all queues), then ask Claude Science to correct the finding's "
+                      "answers" % "; ".join(clashes))
+    owners = sorted(set(where[a][0] for a in answers if a in where))
+    if len(owners) > 1:
+        return None, ("answers items of several workstreams (%s); ask Claude Science to split it into one finding "
+                      "per workstream" % ", ".join("%s: %s" % (w, ", ".join(a for a in answers
+                                                                          if where.get(a, [None])[0] == w))
+                                                   for w in owners))
+    return (owners[0] if owners else settings["default"]), None
+
+
+def duplicate_ids(root: Path, policy: Dict[str, Any]) -> Dict[str, List[str]]:
+    """SQ ids that appear in more than one queue file (agents that edit queues by hand can collide)."""
+    files = {}  # type: Dict[str, List[str]]
+    for r in list_requests(root, policy):
+        files.setdefault(r["id"], []).append(r.get("file") or QUESTIONS_REL)
+    return {k: v for k, v in files.items() if len(v) > 1}
+
+
+def tick_requests(root: Path, ids: List[str], answered_by: str, rel: str = QUESTIONS_REL) -> Dict[str, List[str]]:
+    path = root / rel
     ticked, already, unknown = [], [], list(ids)
     if not path.is_file():
         return {"ticked": ticked, "already": already, "unknown": unknown}
@@ -1193,9 +1560,9 @@ def tick_requests(root: Path, ids: List[str], answered_by: str) -> Dict[str, Lis
     return {"ticked": ticked, "already": already, "unknown": unknown}
 
 
-def note_progress(root: Path, ids: List[str], ref: str) -> Dict[str, List[str]]:
+def note_progress(root: Path, ids: List[str], ref: str, rel: str = QUESTIONS_REL) -> Dict[str, List[str]]:
     """For `partial: true` findings: append ' — progress: REF' to each open item (once per REF)."""
-    path = _questions_path(root)
+    path = root / rel
     progress, already, closed, unknown = [], [], [], list(ids)
     result = {"progress": progress, "already": already, "closed": closed, "unknown": unknown}
     if not path.is_file():
@@ -1221,41 +1588,57 @@ def note_progress(root: Path, ids: List[str], ref: str) -> Dict[str, List[str]]:
 
 def cmd_requests(args: argparse.Namespace) -> int:
     root = require_project(args.project_dir)
-    items = list_requests(root)
+    policy = load_policy(root)
+    ws = resolve_ws(root, policy, args.ws, required=False)
+    items = list_requests(root, policy, ws)
     shown = items if args.all else [r for r in items if r["open"]]
-    _emit({"file": QUESTIONS_REL, "open": sum(1 for r in items if r["open"]),
-           "answered": sum(1 for r in items if not r["open"]), "items": shown})
+    settings = ws_settings(policy)
+    out = {"file": settings["queue"] if settings and ws is None else queue_rel(policy, ws),
+           "open": sum(1 for r in items if r["open"]),
+           "answered": sum(1 for r in items if not r["open"]), "items": shown}  # type: Dict[str, Any]
+    if ws:
+        out["workstream"] = ws
+    _emit(out)
     return 0
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
     root = require_project(args.project_dir)
+    policy = load_policy(root)
+    ws = resolve_ws(root, policy, args.ws, required=True)
+    rel = queue_rel(policy, ws)
     if not (root / ".planning").is_dir():
-        raise BridgeError("no .planning/ directory; the request queue lives in %s" % QUESTIONS_REL)
+        raise BridgeError("no .planning/ directory; the request queue lives in %s" % rel)
     text = " ".join(args.text.split())
     if not text:
         raise BridgeError("empty question")
-    ensure_requests_section(root)
-    items = list_requests(root)
-    dup = [r["id"] for r in items if r["text"].split("):", 1)[-1].split(" — ")[0].strip().lower() == text.lower()]
-    if dup:
-        raise BridgeError("the same question is already queued as %s" % ", ".join(dup))
-    nums = [int(r["id"][3:]) for r in items]
-    new_id = "SQ-%03d" % ((max(nums) if nums else 0) + 1)
-    line = "- [ ] %s (%s, %s): %s" % (new_id, _dt.date.today().isoformat(), args.by, text)
-    if args.context:
-        line += " — context: %s" % args.context
-    if args.affects:
-        line += "; affects: %s" % args.affects if args.context else " — affects: %s" % args.affects
-    path = _questions_path(root)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    bounds = _section_bounds(lines)
-    insert_at = bounds.stop if bounds else len(lines)
-    while insert_at > 0 and not lines[insert_at - 1].strip():
-        insert_at -= 1
-    lines.insert(insert_at, line)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    _emit({"ok": True, "id": new_id, "line": line, "file": QUESTIONS_REL})
+    with _Lock(root, QUEUE_LOCK_REL):
+        ensure_requests_section(root, rel, "# Questions for Claude Science (%s)" % ws if ws else
+                                "# Open Research Questions")
+        items = list_requests(root, policy)  # every queue: numbers and duplicates are project-wide
+        dup = ["%s%s" % (r["id"], " (%s)" % r["workstream"] if r.get("workstream") else "") for r in items
+               if r["text"].split("):", 1)[-1].split(" — ")[0].strip().lower() == text.lower()]
+        if dup:
+            raise BridgeError("the same question is already queued as %s" % ", ".join(dup))
+        nums = [int(r["id"][3:]) for r in items]
+        new_id = "SQ-%03d" % ((max(nums) if nums else 0) + 1)
+        line = "- [ ] %s (%s, %s): %s" % (new_id, _dt.date.today().isoformat(), args.by, text)
+        if args.context:
+            line += " — context: %s" % args.context
+        if args.affects:
+            line += "; affects: %s" % args.affects if args.context else " — affects: %s" % args.affects
+        path = root / rel
+        lines = path.read_text(encoding="utf-8").splitlines()
+        bounds = _section_bounds(lines)
+        insert_at = bounds.stop if bounds else len(lines)
+        while insert_at > 0 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, line)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = {"ok": True, "id": new_id, "line": line, "file": rel}  # type: Dict[str, Any]
+    if ws:
+        out["workstream"] = ws
+    _emit(out)
     return 0
 
 
@@ -1471,7 +1854,33 @@ def _inbox_report(root: Path) -> Dict[str, Any]:
                 findings.append(validate_finding(p))
             else:
                 attachments.append(p.name)
+    try:
+        policy = load_policy(root)
+    except BridgeError:
+        policy = {}
+    if ws_settings(policy) is not None:
+        for f in findings:
+            owner, problem = finding_owner(root, policy, f["meta"])
+            f["workstream"] = owner
+            if problem:
+                f["owner_problem"] = problem
     return {"findings": findings, "attachments": attachments}
+
+
+def _for_ws(findings: List[Dict[str, Any]], ws: Optional[str], default: Optional[str]) -> List[Dict[str, Any]]:
+    """The findings the session of workstream WS should route (all of them without workstreams). Findings whose
+    owner can't be settled go to the default workstream, the only one that may reject them."""
+    if ws is None:
+        return findings
+    return [f for f in findings if f.get("workstream") == ws or (f.get("workstream") is None and ws == default)]
+
+
+def _ws_counts(findings: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {}  # type: Dict[str, int]
+    for f in findings:
+        key = f.get("workstream") or "unsettled"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -1492,6 +1901,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     policy = load_policy(root)
     out = _outbox_report(root, policy["access"])
     inb = _inbox_report(root)
+    ws = resolve_ws(root, policy, args.ws, required=False)
+    settings = ws_settings(policy)
+    mine = _for_ws(inb["findings"], ws, settings["default"] if settings else None)
+    extra = {}  # type: Dict[str, Any]
+    if settings is not None:
+        extra = {"workstreams": {"names": workstream_names(root, policy), "default": settings["default"],
+                                 "queue": settings["queue"], "this_session": ws,
+                                 "pending_by_workstream": _ws_counts(inb["findings"]),
+                                 "duplicate_sq_ids": duplicate_ids(root, policy)}}
     _emit({
         "project": str(root),
         "plugin_version": PLUGIN_VERSION,
@@ -1501,20 +1919,29 @@ def cmd_status(args: argparse.Namespace) -> int:
         "skill_min_version": policy["skill_min_version"],
         "privacy": policy["privacy"],
         "outbox": out,
-        "pending": [{"file": Path(f["file"]).name, "ok": f["ok"], "errors": f["errors"], **f["meta"]}
-                    for f in inb["findings"]],
+        "pending": [_pending_entry(f) for f in mine],
         "attachments": inb["attachments"],
         "gsd": gsd_report(root),
         "access": policy["access"],
         "do_not_read": policy["do_not_read"],
         "compute": policy["compute"],
-        "requests_open": [r for r in list_requests(root) if r["open"]],
-        "consult": {k: v for k, v in consult_report(root, policy, probe=False).items()
+        "compute_gated": {h: host_gate(root, s) for h, s in policy["compute"].items() if host_gate(root, s)},
+        "requests_open": [r for r in list_requests(root, policy, ws) if r["open"]],
+        "consult": {k: v for k, v in consult_report(root, policy, probe=False, ws=ws).items()
                     if k in ("auto", "wait_minutes", "ask_gate", "unsent", "sent_awaiting")},
         "selftest_pending": (root / "science" / "inbox" / SELFTEST_NAME).is_file(),
         "last_selftest": _last_selftest(root),
+        **extra,
     })
     return 0
+
+
+def _pending_entry(f: Dict[str, Any]) -> Dict[str, Any]:
+    entry = {"file": Path(f["file"]).name, "ok": f["ok"], "errors": f["errors"], **f["meta"]}
+    for key in ("workstream", "owner_problem"):
+        if key in f:
+            entry[key] = f[key]
+    return entry
 
 
 def cmd_outbox_clean(args: argparse.Namespace) -> int:
@@ -1559,6 +1986,18 @@ def cmd_archive(args: argparse.Namespace) -> int:
                           % "; ".join(result["errors"]))
     if (archive / src.name).exists():
         raise BridgeError("science/archive/%s already exists" % src.name)
+    policy = load_policy(root)
+    ws = resolve_ws(root, policy, args.ws, required=True)
+    owner, problem = finding_owner(root, policy, result["meta"])
+    if ws is not None:
+        if problem:
+            if args.route not in ("rejected", "manual") or ws != ws_settings(policy)["default"]:
+                raise BridgeError("%s %s; until then only the default workstream (%s) may archive it, with --route "
+                                  "rejected or manual" % (src.name, problem, ws_settings(policy)["default"]))
+            owner = ws
+        elif owner != ws:
+            raise BridgeError("%s belongs to workstream %s (it answers that workstream's questions, or none); route it "
+                              "from that workstream's session with --ws %s" % (src.name, owner, owner))
 
     moved = [src.name]
     text = src.read_text(encoding="utf-8", errors="replace")
@@ -1571,16 +2010,33 @@ def cmd_archive(args: argparse.Namespace) -> int:
                 moved.append(att.name)
     shutil.move(str(src), str(archive / src.name))
     record = {"file": src.name, "route": args.route, "ref": args.ref, "routed_at": _now(), "moved": moved}
+    if ws is not None:
+        record["workstream"] = ws
     answers = result["meta"].get("answers") if result["ok"] else None
-    if answers and args.route != "rejected":
+    if answers and args.route != "rejected" and not problem:
         ids = [str(a) for a in answers]
-        if result["meta"].get("partial") is True:
-            record["requests"] = note_progress(root, ids, "science/archive/" + src.name)
+        ref = "science/archive/" + src.name
+        update = note_progress if result["meta"].get("partial") is True else tick_requests
+        if ws is None:
+            record["requests"] = update(root, ids, ref, QUESTIONS_REL)
         else:
-            record["requests"] = tick_requests(root, ids, "science/archive/" + src.name)
-    with (archive / "routing.jsonl").open("a", encoding="utf-8") as f:
+            # The owner's items can sit in its own queue or in a shared queue left from before workstreams.
+            files = {}  # type: Dict[str, List[str]]
+            for r in list_requests(root, policy, owner):
+                if r["id"] in ids:
+                    files.setdefault(r["file"], []).append(r["id"])
+            merged = {k: [] for k in update(root, [], ref, QUESTIONS_REL)}  # type: Dict[str, List[str]]
+            for rel, rel_ids in sorted(files.items()):
+                for key, vals in update(root, rel_ids, ref, rel).items():
+                    if key != "unknown":
+                        merged.setdefault(key, []).extend(vals)
+            found = set(i for rel_ids in files.values() for i in rel_ids)
+            merged["unknown"] = [i for i in ids if i not in found]
+            record["requests"] = merged
+    log = routing_log_name(ws)
+    with (archive / log).open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    _emit({"ok": True, **record})
+    _emit({"ok": True, "log": "science/archive/" + log, **record})
     return 0
 
 
@@ -1643,10 +2099,15 @@ def _hint_selftest(root: Path) -> Optional[str]:
         return ("[science-bridge] Claude Science's self-test result is waiting in science/inbox/%s; run "
                 "/science-bridge:bridge verify." % SELFTEST_NAME)
     last = _last_selftest(root)
-    if last is None or vtuple(last.get("skill_version")) < vtuple(SKILL_VERSION):
+    need = max(required_skill_version(load_policy(root)), load_policy(root)["skill_min_version"], key=vtuple)
+    if last is None or vtuple(last.get("skill_version")) < vtuple(need):
         return ("[science-bridge] Claude Science hasn't confirmed skill v%s yet. Run /science-bridge:bridge cs-setup, "
-                "republish the skill, then run the self-test." % SKILL_VERSION)
+                "republish the skill, then run the self-test." % need)
     return None
+
+
+def _by_ws_text(counts: Dict[str, int]) -> str:
+    return ", ".join("%s %d" % (k, v) for k, v in sorted(counts.items()))
 
 
 def _hint_findings(root: Path) -> Optional[str]:
@@ -1654,25 +2115,39 @@ def _hint_findings(root: Path) -> Optional[str]:
     if not pending:
         return None
     invalid = sum(1 for f in pending if not f["ok"])
+    if ws_settings(load_policy(root)) is not None:
+        return ("[science-bridge] science/inbox has %d Claude Science finding(s) waiting%s, by workstream: %s. Each "
+                "workstream routes its own: /science-bridge:bridge ingest --ws <workstream> in that workstream's "
+                "session." % (len(pending), " (%d invalid)" % invalid if invalid else "", _by_ws_text(_ws_counts(pending))))
     return ("[science-bridge] science/inbox has %d Claude Science finding(s) waiting%s. Run "
             "/science-bridge:bridge ingest to route them into GSD."
             % (len(pending), " (%d invalid)" % invalid if invalid else ""))
 
 
 def _hint_requests(root: Path) -> Optional[str]:
-    open_requests = [r for r in list_requests(root) if r["open"]]
+    policy = load_policy(root)
+    open_requests = [r for r in list_requests(root, policy) if r["open"]]
     if not open_requests:
         return None
-    if consult_settings(load_policy(root))["auto"]:
-        unsent = consult_report(root, probe=False)["unsent"]
+    multi = ws_settings(policy) is not None
+    where = ""
+    if multi:
+        counts = {}  # type: Dict[str, int]
+        for r in open_requests:
+            counts[r["workstream"]] = counts.get(r["workstream"], 0) + 1
+        where = " by workstream: %s;" % _by_ws_text(counts)
+    if consult_settings(policy)["auto"]:
+        unsent = consult_report(root, policy, probe=False)["unsent"]
         if unsent:
-            return ("[science-bridge] auto-consult is on and %d question(s) haven't been sent to Claude Science (%s). "
-                    "Run /science-bridge:bridge consult to send them through Claude in Chrome."
-                    % (len(unsent), ", ".join(u["id"] for u in unsent[:6])))
+            return ("[science-bridge] auto-consult is on and %d question(s) haven't been sent to Claude Science (%s%s). "
+                    "Run /science-bridge:bridge consult%s to send them through Claude in Chrome."
+                    % (len(unsent), ", ".join(u["id"] for u in unsent[:6]), ";" + where.rstrip(";") if multi else "",
+                       " --ws <workstream> (this session's own only)" if multi else ""))
         return ("[science-bridge] %d question(s) were sent to Claude Science and await findings; "
                 "/science-bridge:bridge consult shows them." % len(open_requests))
-    return ("[science-bridge] %d open question(s) for Claude Science (%s). In Claude Science, ask it to process the "
-            "open SQ requests." % (len(open_requests), QUESTIONS_REL))
+    return ("[science-bridge] %d open question(s) for Claude Science (%s%s). In Claude Science, ask it to process "
+            "the open SQ requests." % (len(open_requests), ws_settings(policy)["queue"] if multi else QUESTIONS_REL,
+                                       ";" + where.rstrip(";") if multi else ""))
 
 
 def _hint_consult_rule(root: Path) -> Optional[str]:
@@ -1736,10 +2211,25 @@ def cmd_wait(args: argparse.Namespace) -> int:
     """
     import time
     root = require_project(args.project_dir)
+    policy = load_policy(root)
+    ws = resolve_ws(root, policy, args.ws, required=False)
+    default = ws_settings(policy)["default"] if ws_settings(policy) else None
+
+    def wanted(name: str) -> bool:
+        """With --ws, only the self-test and this workstream's findings end the wait."""
+        if name == SELFTEST_NAME:
+            return True
+        if not name.endswith(".md"):
+            return False
+        if ws is None:
+            return True
+        owner, problem = finding_owner(root, policy, validate_finding(root / "science" / "inbox" / name)["meta"])
+        return owner == ws or (problem is not None and ws == default)
+
     interval = max(1.0, float(args.interval))
     deadline = time.time() + max(0.0, float(args.timeout))
     start = _inbox_snapshot(root)
-    already = sorted(n for n in start if n.endswith(".md") or n == SELFTEST_NAME)
+    already = sorted(n for n in start if wanted(n))
     if already and not args.new_only:
         changed = already
     else:
@@ -1747,7 +2237,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
         while time.time() < deadline:
             time.sleep(interval)
             now = _inbox_snapshot(root)
-            changed = [n for n in _arrivals(start, now) if n.endswith(".md") or n == SELFTEST_NAME]
+            changed = [n for n in _arrivals(start, now) if (root / "science" / "inbox" / n).is_file() and wanted(n)]
             if changed:
                 break
         if not changed:
@@ -1766,14 +2256,13 @@ def cmd_wait(args: argparse.Namespace) -> int:
         if now != last:
             last, quiet_since = now, time.time()
     inb = _inbox_report(root)
-    findings = [{"file": Path(f["file"]).name, "ok": f["ok"], "errors": f["errors"], **f["meta"]}
-                for f in inb["findings"]]
+    findings = [_pending_entry(f) for f in _for_ws(inb["findings"], ws, default)]
     selftest = (root / "science" / "inbox" / SELFTEST_NAME).is_file()
     nxt = []
     if selftest:
         nxt.append("/science-bridge:bridge verify")
     if findings:
-        nxt.append("/science-bridge:bridge ingest")
+        nxt.append("/science-bridge:bridge ingest" + (" --ws %s" % ws if ws else ""))
     _emit({"ok": True, "arrived": sorted(set(changed) | set(n for n in last if n not in start)),
            "timed_out": False, "findings": findings, "attachments": inb["attachments"],
            "selftest_waiting": selftest, "next": nxt})
@@ -1835,7 +2324,19 @@ def _consult_state_path(root: Path) -> Path:
     return root / CONSULT_STATE_REL
 
 
+CONSULT_SLOT_KEYS = ("last_hint", "last_gate", "handback")
+CONSULT_SESSION_MAX_HOURS = 48  # per-session reminder state older than this is dropped
+
+
+def _consult_slot(raw: Any) -> Dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    return {k: (raw.get(k) if isinstance(raw.get(k), dict) else {}) for k in CONSULT_SLOT_KEYS}
+
+
 def load_consult_state(root: Path) -> Dict[str, Any]:
+    """`sent` is project-wide (SQ ids are unique). The reminder state (last hint, last ask-gate refusal, a noted
+    hand-back) is kept per Claude Code session under `sessions`, so one session's reminder never silences another's;
+    the top-level copy serves payloads without a session id."""
     try:
         raw = json.loads(_consult_state_path(root).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1843,11 +2344,34 @@ def load_consult_state(root: Path) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raw = {}
     sent = raw.get("sent") if isinstance(raw.get("sent"), dict) else {}
-    last = raw.get("last_hint") if isinstance(raw.get("last_hint"), dict) else {}
-    gate = raw.get("last_gate") if isinstance(raw.get("last_gate"), dict) else {}
-    handback = raw.get("handback") if isinstance(raw.get("handback"), dict) else {}
-    return {"sent": {str(k): str(v) for k, v in sent.items()}, "last_hint": last, "last_gate": gate,
-            "handback": handback}
+    sessions = raw.get("sessions") if isinstance(raw.get("sessions"), dict) else {}
+    state = {"sent": {str(k): str(v) for k, v in sent.items()}}  # type: Dict[str, Any]
+    state.update(_consult_slot(raw))
+    state["sessions"] = {str(k): _consult_slot(v) for k, v in sessions.items() if isinstance(v, dict)}
+    return state
+
+
+def _session_slot(state: Dict[str, Any], session_id: Any) -> Dict[str, Any]:
+    """This session's reminder state. A new session gets a detached empty slot; _keep_slot stores it once it holds
+    something, so a hook call with nothing to note doesn't rewrite consult.json."""
+    if not isinstance(session_id, str) or not session_id:
+        return state
+    return state["sessions"].get(session_id) or _consult_slot({})
+
+
+def _keep_slot(state: Dict[str, Any], session_id: Any, slot: Dict[str, Any]) -> None:
+    if isinstance(session_id, str) and session_id and slot is not state and any(slot[k] for k in CONSULT_SLOT_KEYS):
+        state["sessions"][session_id] = slot
+
+
+def _prune_sessions(state: Dict[str, Any], now: _dt.datetime, keep: Any) -> None:
+    for sid in list(state["sessions"]):
+        if sid == keep:
+            continue
+        stamps = [_parse_utc(state["sessions"][sid][k].get("at")) for k in CONSULT_SLOT_KEYS]
+        latest = max((s for s in stamps if s is not None), default=None)
+        if latest is None or (now - latest).total_seconds() > CONSULT_SESSION_MAX_HOURS * 3600:
+            del state["sessions"][sid]
 
 
 def save_consult_state(root: Path, state: Dict[str, Any]) -> None:
@@ -1877,16 +2401,30 @@ def claude_science_status() -> Dict[str, Any]:
     return out
 
 
-def consult_report(root: Path, policy: Optional[Dict[str, Any]] = None, probe: bool = True) -> Dict[str, Any]:
+def consult_report(root: Path, policy: Optional[Dict[str, Any]] = None, probe: bool = True,
+                   ws: Optional[str] = None) -> Dict[str, Any]:
+    """With workstreams and WS, only that workstream's questions and findings; without WS, all of them, each
+    carrying its workstream."""
     policy = policy if policy is not None else load_policy(root)
     settings = consult_settings(policy)
     state = load_consult_state(root)
-    open_items = [r for r in list_requests(root) if r["open"]]
-    unsent = [{"id": r["id"], "text": r["text"]} for r in open_items if r["id"] not in state["sent"]]
-    sent = [{"id": r["id"], "sent_at": state["sent"][r["id"]]} for r in open_items if r["id"] in state["sent"]]
-    pending = [Path(f["file"]).name for f in _inbox_report(root)["findings"]]
+    open_items = [r for r in list_requests(root, policy, ws) if r["open"]]
+
+    def item(r: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
+        out = {"id": r["id"]}
+        out.update(extra)
+        if r.get("workstream"):
+            out["workstream"] = r["workstream"]
+        return out
+
+    unsent = [item(r, text=r["text"]) for r in open_items if r["id"] not in state["sent"]]
+    sent = [item(r, sent_at=state["sent"][r["id"]]) for r in open_items if r["id"] in state["sent"]]
+    ws_cfg = ws_settings(policy)
+    findings = _for_ws(_inbox_report(root)["findings"], ws, ws_cfg["default"] if ws_cfg else None)
+    pending = [Path(f["file"]).name for f in findings]
+    flag = " --ws %s" % ws if ws else ""
     if pending:
-        nxt = "ingest the findings waiting in science/inbox/ (/science-bridge:bridge ingest --yes)"
+        nxt = "ingest the findings waiting in science/inbox/ (/science-bridge:bridge ingest --yes%s)" % flag
     elif unsent:
         nxt = "send %s to Claude Science (the consult round in the bridge skill)" % ", ".join(u["id"] for u in unsent)
     elif sent:
@@ -1895,7 +2433,11 @@ def consult_report(root: Path, policy: Optional[Dict[str, Any]] = None, probe: b
         nxt = "nothing to do"
     out = {"auto": settings["auto"], "wait_minutes": settings["wait_minutes"], "ask_gate": settings["ask_gate"],
            "unsent": unsent,
-           "sent_awaiting": sent, "pending_findings": pending, "next": nxt}
+           "sent_awaiting": sent, "pending_findings": pending, "next": nxt}  # type: Dict[str, Any]
+    if ws_cfg is not None:
+        out["workstream"] = ws
+        out["pending_by_workstream"] = {f: w for f, w in ((Path(x["file"]).name, x.get("workstream") or "unsettled")
+                                                           for x in findings)}
     if probe:
         out["claude_science"] = claude_science_status()
     return out
@@ -1925,18 +2467,32 @@ def _consult_hint_text(report: Dict[str, Any]) -> str:
         shown = []
         for item in report["unsent"][:5]:
             text = item["text"].split("):", 1)[-1].split(" — ")[0].strip()
-            shown.append("%s (%s)" % (item["id"], text[:90] + ("…" if len(text) > 90 else "")))
+            shown.append("%s%s (%s)" % (item["id"], " [%s]" % item["workstream"] if item.get("workstream") else "",
+                                        text[:90] + ("…" if len(text) > 90 else "")))
         more = " and %d more" % (len(report["unsent"]) - 5) if len(report["unsent"]) > 5 else ""
         parts.append("%d question(s) for Claude Science are queued but not sent yet: %s%s."
                      % (len(report["unsent"]), "; ".join(shown), more))
     if report["pending_findings"]:
-        parts.append("%d Claude Science finding(s) are waiting in science/inbox/." % len(report["pending_findings"]))
+        by_ws = report.get("pending_by_workstream")
+        if by_ws:
+            counts = {}  # type: Dict[str, int]
+            for w in by_ws.values():
+                counts[w] = counts.get(w, 0) + 1
+            parts.append("%d Claude Science finding(s) are waiting in science/inbox/ (by workstream: %s)."
+                         % (len(report["pending_findings"]), _by_ws_text(counts)))
+        else:
+            parts.append("%d Claude Science finding(s) are waiting in science/inbox/." % len(report["pending_findings"]))
+    ws_rule = ""
+    if "workstream" in report:
+        ws_rule = (" This project works in GSD workstreams: act only on the questions and findings of the workstream "
+                   "this session works on (the one you pass to GSD with --ws), and pass the same --ws to every bridge "
+                   "command; leave the other workstreams' items to their own sessions.")
     return ("%s %s Auto-consult is on for this project, so before you start the next step, run the consult round "
             "(the \"consult\" section of the science-bridge bridge skill, /science-bridge:bridge consult): ingest "
             "waiting findings with --yes, send unsent questions to Claude Science through Claude in Chrome, and "
             "wait up to %s minutes for the answers before continuing work that depends on them. If you can't use "
-            "Claude in Chrome here, don't try: say once that the questions stay queued, and continue."
-            % (CONSULT_TAG, " ".join(parts), report["wait_minutes"]))
+            "Claude in Chrome here, don't try: say once that the questions stay queued, and continue.%s"
+            % (CONSULT_TAG, " ".join(parts), report["wait_minutes"], ws_rule))
 
 
 def _payload_text(value: Any, limit: int = 400000) -> str:
@@ -1977,11 +2533,12 @@ def _handback_kind(text: str) -> Optional[str]:
     return None
 
 
-def _due_reminders(root: Path, policy: Dict[str, Any], state: Dict[str, Any], now: _dt.datetime) -> List[str]:
+def _due_reminders(root: Path, policy: Dict[str, Any], state: Dict[str, Any], now: _dt.datetime,
+                   ws: Optional[str] = None) -> List[str]:
     """The reminders the orchestrating session hasn't had yet: queued consult work (not repeated unchanged within
     CONSULT_REHINT_MINUTES) and a noted hand-back (once). Marks them as given in STATE; the caller saves it."""
     texts = []  # type: List[str]
-    report = consult_report(root, policy, probe=False)
+    report = consult_report(root, policy, probe=False, ws=ws)
     if report["unsent"] or report["pending_findings"]:
         key = hashlib.sha256(json.dumps([[u["id"] for u in report["unsent"]], report["pending_findings"]])
                              .encode("utf-8")).hexdigest()[:16]
@@ -2027,13 +2584,19 @@ def consult_hook(payload: Dict[str, Any], now: Optional[_dt.datetime] = None) ->
         return None
     now = now or _dt.datetime.now(_dt.timezone.utc)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Subagent events carry the session id of the session that spawned them, so a hand-back noted here reaches
+    # the orchestrator of that session only.
+    session_id = payload.get("session_id")
     handed_back = _handback_report(payload)
     if handed_back is not None:  # runs inside the subagent: note it for the orchestrator, say nothing here
         kind = _handback_kind(handed_back)
         if kind:
-            state = load_consult_state(root)
-            state["handback"] = {"what": kind, "agent": str(payload.get("agent_type") or ""), "at": stamp}
-            save_consult_state(root, state)
+            with _Lock(root, CONSULT_LOCK_REL):
+                state = load_consult_state(root)
+                slot = _session_slot(state, session_id)
+                slot["handback"] = {"what": kind, "agent": str(payload.get("agent_type") or ""), "at": stamp}
+                _keep_slot(state, session_id, slot)
+                save_consult_state(root, state)
         return None
     if payload.get("agent_id"):
         return None  # inside a subagent: it can't drive Chrome; the main session gets the reminder next
@@ -2041,22 +2604,32 @@ def consult_hook(payload: Dict[str, Any], now: Optional[_dt.datetime] = None) ->
     gate = event == "PreToolUse"
     if gate and (payload.get("tool_name") != "AskUserQuestion" or not settings["ask_gate"]):
         return None
-    state = load_consult_state(root)
-    before = json.dumps(state, sort_keys=True)
-    texts = _due_reminders(root, policy, state, now)
-    out = None  # type: Optional[Dict[str, Any]]
-    if gate:
-        question = _payload_text(payload.get("tool_input"))
-        key = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
-        if texts or _gate_is_due(state, question, key, now):
-            state["last_gate"] = {"key": key, "at": stamp}
-            out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                          "permissionDecisionReason": "\n".join(texts + [CONSULT_GATE_TEXT])}}
-    elif texts:
-        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n".join(texts)}}
-    if json.dumps(state, sort_keys=True) != before:
-        save_consult_state(root, state)
+    with _Lock(root, CONSULT_LOCK_REL):
+        state = load_consult_state(root)
+        before = json.dumps(state, sort_keys=True)
+        _prune_sessions(state, now, session_id)
+        slot = _session_slot(state, session_id)
+        texts = _due_reminders(root, policy, slot, now, _env_ws(root, policy))
+        out = None  # type: Optional[Dict[str, Any]]
+        if gate:
+            question = _payload_text(payload.get("tool_input"))
+            key = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+            if texts or _gate_is_due(slot, question, key, now):
+                slot["last_gate"] = {"key": key, "at": stamp}
+                out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                              "permissionDecisionReason": "\n".join(texts + [CONSULT_GATE_TEXT])}}
+        elif texts:
+            out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n".join(texts)}}
+        _keep_slot(state, session_id, slot)
+        if json.dumps(state, sort_keys=True) != before:
+            save_consult_state(root, state)
     return out
+
+
+def _env_ws(root: Path, policy: Dict[str, Any]) -> Optional[str]:
+    """$GSD_WORKSTREAM, when it names one of this project's workstreams (hooks can't see --ws)."""
+    ws = os.environ.get(WS_ENV)
+    return ws if ws and ws in workstream_names(root, policy) else None
 
 
 def cmd_consult(args: argparse.Namespace) -> int:
@@ -2078,6 +2651,7 @@ def cmd_consult(args: argparse.Namespace) -> int:
             pass
         return 0
     root = require_project(args.project_dir)
+    policy = load_policy(root)
     if args.action in ("on", "off"):
         if args.ids:
             raise BridgeError("consult %s takes no SQ ids" % args.action)
@@ -2096,29 +2670,38 @@ def cmd_consult(args: argparse.Namespace) -> int:
         return 0
     if args.ask_gate is not None:
         raise BridgeError("--ask-gate goes with `consult on` or `consult off`")
+    ws = resolve_ws(root, policy, args.ws, required=args.action == "sent")
     if args.action == "sent":
         if not args.ids:
             raise BridgeError("consult sent needs the SQ ids you handed to Claude Science, e.g. SQ-004 SQ-005")
-        items = {r["id"]: r for r in list_requests(root)}
-        state = load_consult_state(root)
-        recorded, closed, unknown = [], [], []
-        for sq in args.ids:
-            sq = sq.strip().upper()
-            if sq not in items:
-                unknown.append(sq)
-            elif not items[sq]["open"]:
-                closed.append(sq)
-            else:
-                state["sent"][sq] = _now()
-                recorded.append(sq)
-        if recorded:
-            save_consult_state(root, state)
-        _emit({"ok": not unknown, "recorded": recorded, "already_answered": closed, "unknown": unknown,
-               "next": "start `wait --new-only` in the background" if recorded else None})
-        return 0 if not unknown else 1
+        items = {r["id"]: r for r in list_requests(root, policy)}
+        with _Lock(root, CONSULT_LOCK_REL):
+            state = load_consult_state(root)
+            recorded, closed, unknown = [], [], []
+            foreign = []  # type: List[str]
+            for sq in args.ids:
+                sq = sq.strip().upper()
+                if sq not in items:
+                    unknown.append(sq)
+                elif ws is not None and items[sq].get("workstream") != ws:
+                    foreign.append("%s (%s)" % (sq, items[sq].get("workstream")))
+                elif not items[sq]["open"]:
+                    closed.append(sq)
+                else:
+                    state["sent"][sq] = _now()
+                    recorded.append(sq)
+            if recorded:
+                save_consult_state(root, state)
+        out = {"ok": not unknown and not foreign, "recorded": recorded, "already_answered": closed,
+               "unknown": unknown, "next": "start `wait --new-only` in the background" if recorded else None}
+        if foreign:
+            out["other_workstreams"] = foreign
+            out["note"] = "not recorded: those items belong to other workstreams; their own sessions send them"
+        _emit(out)
+        return 0 if out["ok"] else 1
     if args.ids:
         raise BridgeError("consult status takes no SQ ids")
-    _emit({"ok": True, **consult_report(root)})
+    _emit({"ok": True, **consult_report(root, policy, ws=ws)})
     return 0
 
 
@@ -2127,9 +2710,13 @@ def cmd_consult(args: argparse.Namespace) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="bridge.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--project-dir", default=None)
+    ws_help = "the GSD workstream this session works on (projects with a workstreams block; default $%s)" % WS_ENV
+    ap.add_argument("--ws", dest="ws_top", default=None, help=ws_help)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("init")
     p.add_argument("--no-gsd", action="store_true", help="don't run gsd-setup even if .planning/ exists")
+    p.add_argument("--workstreams-default", default=None,
+                   help="turn on per-workstream queues; NAME owns findings that answer no queued question")
     p = sub.add_parser("cs-setup")
     p.add_argument("--out", default=None, help="where to write the skill zip (default: temp dir)")
     p = sub.add_parser("skill-zip")
@@ -2144,14 +2731,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("outbox-clean")
     p.add_argument("--yes", action="store_true", help="delete the copies (default: dry run, list them)")
     sub.add_parser("check")
-    sub.add_parser("status")
+    p = sub.add_parser("status")
+    p.add_argument("--ws", default=None, help=ws_help)
     p = sub.add_parser("archive")
+    p.add_argument("--ws", default=None, help=ws_help)
     p.add_argument("file")
     p.add_argument("--route", required=True, choices=ROUTES)
     p.add_argument("--ref", required=True, help="where it went, e.g. .planning/notes/2026-11-06-x.md")
     p = sub.add_parser("requests")
+    p.add_argument("--ws", default=None, help=ws_help)
     p.add_argument("--all", action="store_true", help="include answered items")
     p = sub.add_parser("ask")
+    p.add_argument("--ws", default=None, help=ws_help)
     p.add_argument("text")
     p.add_argument("--by", default="user", help="who is asking, e.g. 'gsd-planner phase 3'")
     p.add_argument("--context", default=None, help="paths the question concerns")
@@ -2162,7 +2753,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--interval", type=float, default=10, help="poll interval in seconds (default 10)")
     p.add_argument("--settle", type=float, default=20, help="quiet seconds before reporting (default 20)")
     p.add_argument("--new-only", action="store_true", help="ignore findings already waiting at start")
+    p.add_argument("--ws", default=None, help=ws_help)
     p = sub.add_parser("consult")
+    p.add_argument("--ws", default=None, help=ws_help)
     p.add_argument("action", nargs="?", default="status", choices=("status", "on", "off", "sent", "hook"))
     p.add_argument("ids", nargs="*", help="for `sent`: the SQ ids handed to Claude Science")
     p.add_argument("--wait-minutes", type=float, default=None,
@@ -2171,6 +2764,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="for `on`/`off`: whether the first AskUserQuestion is refused once so Claude Science is "
                         "consulted before the owner is asked (default on)")
     args = ap.parse_args(argv)
+    if getattr(args, "ws", None) is None:
+        args.ws = args.ws_top
     handlers = {"init": cmd_init, "export": cmd_export, "check": cmd_check, "status": cmd_status,
                 "archive": cmd_archive, "session-hint": cmd_session_hint, "gsd-setup": cmd_gsd_setup,
                 "requests": cmd_requests, "ask": cmd_ask, "cs-setup": cmd_cs_setup, "skill-zip": cmd_skill_zip,

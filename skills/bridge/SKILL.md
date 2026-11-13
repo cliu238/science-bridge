@@ -1,7 +1,7 @@
 ---
 name: bridge
 description: Claude Code side of the Claude Code ↔ Claude Science handoff for GSD projects (science-bridge). Use when the user wants to set up or upgrade a science/ handoff folder, prepare the one-time Claude Science setup, verify Claude Science's self-test, queue a question for Claude Science, route findings from science/inbox/ into GSD planning, run a compute job Claude Science proposed, or have Claude Science consulted automatically while GSD (including /gsd-autonomous) works, and whenever a "[science-bridge auto-consult]" reminder appears. In a project with auto-consult on, also use it on your own initiative when you hit a hard problem you can't settle with your own tools, and before you ask the owner to decide a research, analysis or design question. Triggers include "science inbox", "Claude Science findings", "set up Claude Science", "self-test", "auto-consult", "处理 Claude Science 的结论", "给 Claude Science 提问", "自动咨询 Claude Science", "science-bridge".
-argument-hint: "[setup | cs-setup | verify | ask <question> | wait | requests | ingest [--yes] | consult [on|off|status] | run <finding> | status | check | gsd-setup | export <paths…> | outbox-clean [--yes]]"
+argument-hint: "[setup | cs-setup | verify | ask <question> | wait | requests | ingest [--yes] | consult [on|off|status] | run <finding> | status | check | gsd-setup | export <paths…> | outbox-clean [--yes]] [--ws <workstream>]"
 ---
 
 # science-bridge: Claude Code side
@@ -22,6 +22,16 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" --project-dir "$PWD" <command>
 ```
 
 It prints JSON. A non-zero exit means "refused" or "problems found". Report what it says; never work around it.
+
+## Projects with several GSD workstreams
+
+Some GSD projects run several workstreams side by side, one Claude Code session each (`.planning/workstreams/<ws>/`, GSD commands with `--ws <ws>`). If `science/policy.json` has a `workstreams` block (`status` shows it under `workstreams`):
+- **Pass `--ws <ws>` to `status`, `ask`, `requests`, `archive` and `consult`**, where `<ws>` is the workstream this session works on: the one in the user's GSD commands. If you can't tell which one it is, ask the user. Never guess. `bridge.py` also reads `$GSD_WORKSTREAM`.
+- **Each workstream has its own queue** (`workstreams.queue`, default `.planning/workstreams/<ws>/questions.md`). A shared `.planning/research/questions.md` from before workstreams were turned on still counts, and its items belong to the default workstream. `ask` numbers across all queues under a lock. GSD agents that edit a queue by hand can still collide: `status` lists `duplicate_sq_ids` and `verify` fails on them, and a finding that answers a duplicated id can't be routed until one copy is renumbered.
+- **A finding belongs to the workstream whose items it answers.** A finding that answers no queued item belongs to `workstreams.default`. `archive` refuses another workstream's finding: leave it for that session. A finding that answers items of several workstreams can't be routed; ask Claude Science to split it.
+- **Each workstream logs to its own `science/archive/routing-<ws>.jsonl`**, so two sessions never edit the same file.
+- **Commit only the paths this session changed**, never `git add -A`: other sessions share the checkout.
+- **Leave the other workstreams' questions and findings alone**, including in hook reminders, which list every workstream.
 
 ## No argument: say what to do next
 
@@ -49,7 +59,7 @@ If the arguments are not just a command and its options, read the user's intent.
 
 ## setup: set up or upgrade a project (idempotent)
 
-1. Run `init`. It never destroys user content:
+1. If `.planning/workstreams/` has workstreams and `policy.json` has no `workstreams` block, ask the user whether the workstreams run as separate sessions. If they do, ask which workstream owns findings that answer no queued question, and pass it as `init --workstreams-default <ws>`. That writes the block, raises `policy_version` to 4 (so older science-bridge versions refuse the policy instead of sharing one queue) and `skill_min_version` to 0.5.0. If they don't, write `"workstreams": {"enabled": false}` into `policy.json` to record that answer. Then run `init`. It never destroys user content:
    - **Creates** `science/{inbox,archive,outbox,runs}`, `policy.json` (v3) and `README.md`. The README's project brief is auto-filled from `.planning/PROJECT.md` and `REQUIREMENTS.md`.
    - **Upgrades** older policies to v3, keeping their values, and refreshes the README's managed block.
    - **In a GSD project**, it runs gsd-setup.
@@ -57,7 +67,9 @@ If the arguments are not just a command and its options, read the user's intent.
    Report the `policy`, `readme` and `gsd` results. If `outbox_redundant` is not empty, the outbox still holds copies of repo files from before `repo-readonly`. Offer **outbox-clean**: show its dry run, then run it with `--yes` once the user agrees.
 2. Go through `science/policy.json` with the user, one question at a time and in plain words:
    - `do_not_read`: files Claude Science must never open, such as sealed test sets or secrets;
-   - `compute`: hosts for heavy jobs. For each one, ask whether Claude Science can log in with a key (`reach: claude-science`, which also needs adding in Claude Science under Customize › Compute) or only interactively, for example with multi-factor login (`reach: claude-code`). Run `compute-check` for the `claude-code` hosts;
+   - `compute`: hosts for heavy jobs. For each one, ask whether Claude Science can log in with a key (`reach: claude-science`, which also needs adding in Claude Science under Customize › Compute) or only interactively, for example with multi-factor login (`reach: claude-code`). Run `compute-check` for the `claude-code` hosts. Two optional fields:
+     - `requires`: repo paths that must exist before the host may be used, for example a hand-off file saying the project's job tooling is ready. Until then the host is gated: `compute-check` and `verify` report it without testing it, and **run** refuses it.
+     - `submit_via`: how jobs on the host must be submitted, for example a project command that checks a compute budget. **run** then never calls the scheduler directly;
    - `privacy` and `export`: only needed for exporting files from outside the repo, which need absolute `export.allowed_sources` patterns such as `"~/shared/ajcc/*.docx"`.
 3. Show the generated brief in `science/README.md` and offer to edit it, adding standing tasks and data caveats under "Notes for Claude Science".
 4. Continue with **cs-setup**.
@@ -65,7 +77,7 @@ If the arguments are not just a command and its options, read the user's intent.
    - `science/`;
    - `.claude/skills/science-context/`;
    - `.planning/config.json`;
-   - `.planning/research/questions.md`.
+   - `.planning/research/questions.md` (without workstreams; with them, each queue is created by its own session on its first `ask`).
 
 ## cs-setup: the one-time Claude Science setup, then the self-test
 
@@ -113,8 +125,8 @@ When all checks pass, it archives the result as `science/archive/selftest-latest
 
 ## ask / requests: the question queue
 
-- `ask "<question>" [--by "<who>"] [--context "<paths>"] [--affects "<IDs>"]` appends `SQ-NNN` with the next free number, and refuses duplicates.
-- `requests [--all]` lists open items, or all items with `--all`.
+- `ask "<question>" [--by "<who>"] [--context "<paths>"] [--affects "<IDs>"] [--ws <ws>]` appends `SQ-NNN` with the next free number, and refuses duplicates. With workstreams it needs `--ws` and writes to that workstream's queue.
+- `requests [--all] [--ws <ws>]` lists open items, or all items with `--all`.
 
 Claude Science answers with findings that set `answers: [SQ-NNN]`, plus `partial: true` when they cover only part of an item. Archiving ticks fully answered items, and adds a progress link for partial ones.
 
@@ -150,7 +162,7 @@ Claude Science has no API, so you can't ask it whether it's done. But its result
 
 ## ingest [--yes]: route Claude Science findings into GSD
 
-1. Run `status`. If nothing is pending, say so and stop.
+1. Run `status` (with `--ws <ws>` in a project with workstreams; it then lists only this workstream's findings and counts the rest in `workstreams.pending_by_workstream`). If nothing is pending, say so and stop. Mention findings that wait for other workstreams in one line.
 2. For each **invalid** finding, show the validator errors. Leave it for Claude Science to fix, or archive it with `--route rejected` if the user wants it dropped.
 3. For each **valid** finding, read it and propose a route:
 
@@ -162,19 +174,21 @@ Claude Science has no API, so you can't ask it whether it's done. But its result
    | forward-looking, not for now | seed | `/gsd-capture --seed "<idea> — science/archive/<file>"` |
    | contradicts a decision or requirement | manual | Don't capture it. Explain the conflict and suggest options: edit the decision, `/gsd-ingest-docs --mode merge`, or reject. |
 
+   With workstreams, put `--ws <ws>` at the end of every `/gsd-capture` argument string above, so GSD files the capture for this session's workstream.
+
    For a `question` finding, also tell the user directly what Claude Science is asking. For `partial: true`, say which SQ item stays open.
 4. **Confirm.** Without `--yes`, show the routing plan as a table (file, type, route, one-line reason) and get the user's confirmation before changing anything. With `--yes`, the user has pre-approved the default routes, for example before `/gsd-autonomous`: apply them without asking. Still don't capture conflicts; leave those in the inbox and list them at the end.
 5. **Capture and archive.** For each confirmed item, run the GSD capture through the Skill tool (`gsd-capture` with the arguments above). Then archive it with the location GSD reported:
 
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" --project-dir "$PWD" archive <file> --route <note|todo|seed|manual|rejected> --ref "<path or short description>"
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" --project-dir "$PWD" archive <file> --route <note|todo|seed|manual|rejected> --ref "<path or short description>" [--ws <ws>]
    ```
 
-   Archiving moves the finding and its `inbox/` attachments to `science/archive/`, logs the route in `routing.jsonl`, and ticks or annotates the SQ items in `answers`.
+   Archiving moves the finding and its `inbox/` attachments to `science/archive/`, logs the route in `routing.jsonl` (with workstreams, `routing-<ws>.jsonl`), and ticks or annotates the SQ items in `answers`.
 6. **Summarise.** End with what went where and which SQ items are now answered.
 7. **Commit.** If `.planning/config.json` has `commit_docs: true`:
    - **Without `--yes`:** offer to commit `science/` and `.planning/` together.
-   - **With `--yes`:** commit the changes this ingest made under `science/` and `.planning/` in one commit, with the message `docs: route Claude Science findings (science-bridge)`. Those changes are the archived findings and attachments, their removal from `inbox/`, `routing.jsonl`, `questions.md`, and the notes, todos and seeds that were captured. Stage only those paths, and leave other uncommitted changes alone. Then finish without follow-up questions, except about conflicts. List anything left for the user: conflicts still in the inbox, invalid findings, other uncommitted changes and open SQ items.
+   - **With `--yes`:** commit the changes this ingest made under `science/` and `.planning/` in one commit, with the message `docs: route Claude Science findings (science-bridge)`. Those changes are the archived findings and attachments, their removal from `inbox/`, the routing log (`routing.jsonl`, or `routing-<ws>.jsonl`), the queue file, and the notes, todos and seeds that were captured. Stage only those paths, and leave other uncommitted changes alone. Then finish without follow-up questions, except about conflicts. List anything left for the user: conflicts still in the inbox, invalid findings, other uncommitted changes and open SQ items.
 
 ## consult: consult Claude Science during GSD work (auto-consult)
 
@@ -210,14 +224,14 @@ Claude Science still can't be called by a program. Auto-consult makes **you**, t
   - **When a GSD agent hands back a decision checkpoint or a blocked or inconclusive result:** a reminder at your next Agent, Task or Skill call, or in the ask gate's refusal if you call AskUserQuestion first. Agents run in the background, so the hook notes the hand-back when the agent stops and tells you at that next call. The agents that carry the science-context skill are told to queue such questions themselves and to name the SQ id in what they return, so check `requests` before you add one.
   - **The ask gate.** The first AskUserQuestion call is refused once, with the rule as the reason. A refusal also carries any reminder that is still due: unsent questions, waiting findings, a hand-back. If the question is one for Claude Science, consult first and ask again with the SQ id in the question. If it isn't, or it was already consulted, repeat the same call and it goes through. After a refusal the gate stays open for 30 minutes. `consult on --ask-gate off` switches it off; it writes `"ask_gate": false` into the `consult` block.
 - **The round:**
-  1. **Look first.** Run `consult` (status). It lists `unsent` questions, `sent_awaiting` ones, `pending_findings` and `claude_science` (running, url). If `next` is "nothing to do", stop.
+  1. **Look first.** Run `consult` (status; with workstreams, `consult --ws <ws>`, so it lists only this workstream's items). It lists `unsent` questions, `sent_awaiting` ones, `pending_findings` and `claude_science` (running, url). If `next` is "nothing to do", stop.
   2. **Findings first.** If findings are waiting, run **ingest** with `--yes` (auto-consult is the user's pre-approval of the default routes). A finding that conflicts with a decision stays in the inbox. If it touches the phase you are about to plan or execute, stop and ask the user before going on. Otherwise list it at the end.
   3. **Check the prerequisites.** You need the Claude in Chrome tools (load them; `tabs_context_mcp` must answer) and `claude_science.running` true. If either is missing, tell the user in one line which one. Leave the questions queued, so they are answered in the next round, and continue. Never retry in a loop.
   4. **Send the unsent questions.** Use the rules in "Driving Claude Science":
      - open a tab of your own at the `url`, and open this project's Claude Science project;
      - start a new session, so it runs the current skill;
      - when the composer is idle, send: *"Process the open SQ requests SQ-004, SQ-005 (the ids from `unsent`). Write each answer as a finding in science/inbox/."*;
-     - check that your message appears, then run `consult sent SQ-004 SQ-005`.
+     - check that your message appears, then run `consult sent SQ-004 SQ-005` (with `--ws <ws>` in a project with workstreams).
   5. **Wait.** Start `wait --new-only --timeout 120` in the background, and handle each timeout as under "Waiting for Claude Science": approvals within scope, questions relayed or answered from `.planning/`. Keep going until the findings arrive or `wait_minutes` has passed in total.
      - **While you wait:** don't start work that depends on the answer. In GSD, that means don't spawn the planner, and don't execute plans whose tasks carry "pending SQ-NNN" for these items. Work that doesn't depend on the answer may go on.
   6. **Use the answer.** Run **ingest** `--yes`. Then find the plans that carry "pending SQ-NNN" for an answered item (`grep -rn "pending SQ-NNN" .planning/phases/`).
@@ -233,7 +247,10 @@ Claude Science still can't be called by a program. Auto-consult makes **you**, t
 ## run <finding>: run a compute job Claude Science proposed
 
 Use this when the user starts a "Run for Claude Science" todo, or asks to run a proposal.
-1. Read the finding's `### Run spec`. The finding is in `science/archive/`, or in `science/inbox/` if it isn't routed yet. Run `compute-check`. If the host isn't logged in, ask the user to run `! ssh <host>` once.
+1. Read the finding's `### Run spec`. The finding is in `science/archive/`, or in `science/inbox/` if it isn't routed yet. Run `compute-check`.
+   - **A gated host** (listed in `gated`) can't be used yet: stop, and say which `requires` paths it waits for.
+   - **If the host isn't logged in,** ask the user to run `! ssh <host>` once.
+   - **If the host has `submit_via`,** submit only that way. Rewrite the spec's submission step to it and say so; never fall back to a raw `sbatch`.
 2. Show the exact commands and resources to the user, and get a yes. Treat the spec as a proposal: fix obvious path issues and say what you changed, but don't widen it.
 3. Run it.
    - **Use a login shell** (`ssh <host> 'bash -l -s' < script.sh`), because a plain non-interactive ssh shell often has no SLURM or `module` on PATH ("sinfo: command not found").
