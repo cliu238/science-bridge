@@ -207,7 +207,7 @@ Claude Science runs as a local web app at `http://localhost:8765`. With **Claude
 | Chrome | Install the **Claude in Chrome** extension and sign in with the **same Claude account** as Claude Code. If this is the first install, restart Chrome. |
 | Claude in Chrome extension | Site access for **`http://localhost:8765`** (or "on all sites"). Without it, the page is blocked and screenshots fail. |
 | Claude Code | Start it with Chrome enabled (`claude --chrome`). The first time it uses the browser tools (navigate, click, type, screenshot, file upload), it asks for permission. Allow them for this work. |
-| File upload | The browser tool can upload only files that the session may share. `cs-setup` therefore builds the skill zip **inside the project**, at `science/.cache/science-findings-<version>.zip` (git-ignored). If you build it elsewhere, copy it into the project first. |
+| File upload | The browser tool can upload only files that the session may share. `cs-setup` therefore builds the skill zip **inside the project**, at `science/.cache/science-findings.zip` (git-ignored). The name carries no version on purpose: Claude Science names a newly uploaded skill after the file, and refuses a name with dots. If you build it elsewhere, copy it into the project first. |
 | Claude Science | Its own prompts ("Waiting for your approval": package installs, network domains, compute). Claude Code approves those that fit the task, with scope **"This project"**. It asks you about anything else. Pre-approved items can be reviewed or revoked under *Settings › Permissions*. |
 
 Keep in mind:

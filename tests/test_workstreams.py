@@ -409,6 +409,11 @@ class ComputeGate(unittest.TestCase):
         self.assertNotIn("gated", out)
         self.assertIn("succeeded", out["checks"][0]["detail"])
 
+    def test_skill_zip_name_is_a_valid_skill_id(self):
+        # Claude Science names a newly uploaded skill after the zip file and refuses dots.
+        code, out = run(["--project-dir", str(self.root), "cs-setup"])
+        self.assertRegex(Path(out["skill_zip"]).stem, r"^[a-z0-9-]+$")
+
     def test_instructions_mention_gating_only_when_used(self):
         code, out = run(["--project-dir", str(self.root), "cs-setup", "--out", str(self.root / "s.zip")])
         self.assertIn('"requires" paths', out["instructions"])

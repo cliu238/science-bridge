@@ -15,7 +15,7 @@ Commands:
                                     project: skill zip, folder grants, project instructions and
                                     an ordered checklist
   skill-zip [--out ZIP]             build the Claude Science skill zip (top folder
-                                    science-findings/); default <tmp>/science-bridge/
+                                    science-findings/); default <tmp>/science-bridge/<ver>/science-findings.zip
   verify [--max-age-hours N]        check science/inbox/selftest.json (written by the Claude
                                     Science self-test) against this repo and policy.json; exit 1
                                     on any failed check; on success move it to
@@ -198,6 +198,9 @@ REQ_ID_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,7})-\d{2,3}\b")
 REQ_DEF_RE = re.compile(r"\*\*([A-Z][A-Z0-9]{1,7})-\d{2,3}\*\*")
 BRIEF_PLACEHOLDER = "<!-- Fill in: what the project is, what you want from Claude Science, key paths. -->"
 SKILL_ZIP_SKIP = {"__pycache__", ".DS_Store"}
+# Claude Science names a newly uploaded skill after the zip's file name, and a name with dots (a version) is
+# refused, so the zip is always called this; its version is in SKILL.md.
+SKILL_ZIP_NAME = "science-findings.zip"
 MAX_HINT_LINES = 6
 SSH_TIMEOUT = 20
 
@@ -943,7 +946,7 @@ def build_skill_zip(out: Optional[Path] = None) -> Dict[str, Any]:
         raise BridgeError("skill source %s/SKILL.md not found" % src)
     version = _skill_version(src / "SKILL.md") or SKILL_VERSION
     if out is None:
-        out = Path(tempfile.gettempdir()) / "science-bridge" / ("science-findings-%s.zip" % version)
+        out = Path(tempfile.gettempdir()) / "science-bridge" / version / SKILL_ZIP_NAME
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".tmp")
     files = []  # type: List[str]
@@ -995,7 +998,7 @@ def cmd_cs_setup(args: argparse.Namespace) -> int:
                               instructions)
     # Default: inside the project (science/.cache/, git-ignored), so Claude in Chrome can upload it from a
     # session started in this project; system temp dirs are usually outside what the browser tool may read.
-    out = _out_path(args.out) or (root / "science" / ".cache" / ("science-findings-%s.zip" % SKILL_VERSION))
+    out = _out_path(args.out) or (root / "science" / ".cache" / SKILL_ZIP_NAME)
     skill = build_skill_zip(out)
     suggested = "%s (science)" % name
     steps = [
@@ -2724,7 +2727,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("cs-setup")
     p.add_argument("--out", default=None, help="where to write the skill zip (default: temp dir)")
     p = sub.add_parser("skill-zip")
-    p.add_argument("--out", default=None, help="zip path (default: <tmp>/science-bridge/science-findings-<ver>.zip)")
+    p.add_argument("--out", default=None, help="zip path (default: <tmp>/science-bridge/<ver>/science-findings.zip)")
     p = sub.add_parser("verify")
     p.add_argument("--max-age-hours", type=float, default=24.0, help="oldest acceptable self-test (default 24)")
     sub.add_parser("compute-check")

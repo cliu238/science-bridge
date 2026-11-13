@@ -910,7 +910,7 @@ class ClaudeScienceSetup(unittest.TestCase):
             code, out = run(["skill-zip"])
         finally:
             tempfile.tempdir = saved
-        self.assertEqual(Path(out["zip"]), self.tmp / "science-bridge" / ("science-findings-%s.zip" % bridge.SKILL_VERSION))
+        self.assertEqual(Path(out["zip"]), self.tmp / "science-bridge" / bridge.SKILL_VERSION / "science-findings.zip")
         self.assertTrue(Path(out["zip"]).is_file())
 
     def test_cs_setup_default_zip_inside_project_and_gitignored(self):
@@ -921,7 +921,7 @@ class ClaudeScienceSetup(unittest.TestCase):
         code, out = run(["--project-dir", str(root), "cs-setup"])
         self.assertEqual(code, 0, out)
         self.assertEqual(Path(out["skill_zip"]),
-                         root / "science" / ".cache" / ("science-findings-%s.zip" % bridge.SKILL_VERSION))
+                         root / "science" / ".cache" / "science-findings.zip")
         self.assertTrue(Path(out["skill_zip"]).is_file())
 
     def test_cs_setup_grants_instructions_and_steps(self):
