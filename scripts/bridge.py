@@ -873,7 +873,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         created.append("science/policy.json")
     ws_note = None  # type: Optional[str]
     if policy_ok and args.workstreams_default:
+        before_min = min_version
         ws_note = _enable_workstreams(root, args.workstreams_default)
+        min_version = load_policy(root)["skill_min_version"]
+        if before_min and not before_min.startswith(min_version):
+            min_version = "%s (raised for workstreams)" % min_version
     elif policy_ok and workstream_dirs(root) and "workstreams" not in _read_policy_raw(root / "science" / "policy.json"):
         ws_note = ("This project has GSD workstreams (%s) but science/policy.json has no workstreams block, so all of "
                    "them share one question queue and one owner. If they run as separate sessions, run init again "

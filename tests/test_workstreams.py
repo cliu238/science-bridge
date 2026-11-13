@@ -108,6 +108,7 @@ class Enabled(Base):
         policy = self.policy()
         self.assertEqual(policy["policy_version"], 4)
         self.assertEqual(policy["skill_min_version"], bridge.WS_SKILL_VERSION)
+        self.assertTrue(self.out["skill_min_version"].startswith(bridge.WS_SKILL_VERSION), self.out["skill_min_version"])
         self.assertEqual(policy["workstreams"], {"enabled": True, "default": "ideas",
                                                  "queue": bridge.WS_QUEUE_DEFAULT})
         self.assertFalse((self.root / bridge.QUESTIONS_REL).exists(), "no shared queue is created")
