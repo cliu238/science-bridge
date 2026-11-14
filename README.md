@@ -24,7 +24,7 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
 ## Features
 
 **Setup and checks**
-- `setup`: one idempotent command creates or upgrades `science/`. It auto-fills the project brief from `.planning/PROJECT.md` and `REQUIREMENTS.md`, migrates old policies with every value kept, and wires up GSD.
+- `setup`: one idempotent command creates or upgrades `science/`. It auto-fills the project brief from `.planning/PROJECT.md` and `REQUIREMENTS.md` (and refills it on a later run while you haven't edited it, so setup can run before GSD), migrates old policies with every value kept, and wires up GSD.
 - `cs-setup`: prints the one-time Claude Science checklist (skill zip, the two folder grants, the instructions text) for this project.
 - **Self-test and `verify`** check:
   - the skill version;

@@ -871,6 +871,67 @@ class ReadmeSetup(unittest.TestCase):
         self.assertTrue(text.endswith("## Project brief\n\ncustom brief\nsecond line\n"))
         self.assertNotIn("# My notes", text)
 
+    def write_planning(self, requirements=True):
+        (self.root / ".planning").mkdir(exist_ok=True)
+        (self.root / ".planning" / "PROJECT.md").write_text(
+            "# My Project\n\n## What This Is\n\nStages cancer.\n\n## Core Value\n\nCorrect numbers.\n")
+        if requirements:
+            (self.root / ".planning" / "REQUIREMENTS.md").write_text("- **LBL-01** a\n- **EVAL-01** b\n")
+
+    def test_placeholder_brief_fills_in_once_planning_exists(self):
+        run(["--project-dir", str(self.root), "init"])  # setup before GSD: placeholder brief
+        self.assertIn(bridge.BRIEF_PLACEHOLDER, self.readme.read_text())
+        self.write_planning()
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "brief-updated")
+        text = self.readme.read_text()
+        self.assertNotIn(bridge.BRIEF_PLACEHOLDER, text)
+        self.assertIn("**What the project is:** Stages cancer.\n", text)
+        self.assertIn("**Requirement ID prefixes for `affects`:** LBL (1), EVAL (1)\n", text)
+        self.assertEqual(text.count("## Project brief"), 1)
+        self.assertEqual(bridge._split_managed(text)[1], bridge._split_managed(self.template)[1])
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "unchanged")
+
+    def test_unedited_auto_brief_follows_planning_changes(self):
+        self.write_planning(requirements=False)
+        run(["--project-dir", str(self.root), "init"])
+        self.assertNotIn("Requirement ID prefixes", self.readme.read_text())
+        (self.root / ".planning" / "REQUIREMENTS.md").write_text("- **LBL-01** a\n")
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "brief-updated")
+        self.assertIn("**Requirement ID prefixes for `affects`:** LBL (1)\n", self.readme.read_text())
+
+    def test_edited_brief_is_never_regenerated(self):
+        run(["--project-dir", str(self.root), "init"])
+        text = self.readme.read_text()
+        self.readme.write_text(text.replace("anything else -->", "anything else --> Use only synthetic cases."))
+        edited = self.readme.read_text()
+        self.write_planning()
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "unchanged")
+        self.assertEqual(self.readme.read_text(), edited)
+        # an edited auto brief (marker kept, text changed) is left alone too
+        shutil.rmtree(self.root / "science")
+        run(["--project-dir", str(self.root), "init"])
+        text = self.readme.read_text().replace("Stages cancer.", "Stages head and neck cancer.")
+        self.readme.write_text(text)
+        (self.root / ".planning" / "REQUIREMENTS.md").write_text("- **NEW-01** a\n")
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "unchanged")
+        self.assertEqual(self.readme.read_text(), text)
+
+    def test_pre_marker_placeholder_brief_is_filled(self):
+        # README written by an older version: the bare placeholder brief, no auto-brief marker
+        run(["--project-dir", str(self.root), "init"])
+        old = bridge.AUTO_BRIEF_RE.sub("\n", self.readme.read_text())
+        self.assertTrue(old.endswith(bridge.BRIEF_PLACEHOLDER + "\n\n" + bridge.BRIEF_NOTES_LINE + "\n"))
+        self.readme.write_text(old)
+        self.write_planning()
+        code, out = run(["--project-dir", str(self.root), "init"])
+        self.assertEqual(out["readme"], "brief-updated")
+        self.assertIn("**Core value:** Correct numbers.\n", self.readme.read_text())
+
 
 class ClaudeScienceSetup(unittest.TestCase):
     def setUp(self):
@@ -1218,6 +1279,41 @@ class SelfTestAndVerify(unittest.TestCase):
         code, out = run(["--project-dir", str(self.root), "compute-check"])
         self.assertEqual((code, out["checks"]), (0, []))
         self.assertIn("note", out)
+
+    def test_compute_check_unknown_host_says_to_add_an_alias(self):
+        policy = read_json(self.root / "science" / "policy.json")
+        policy["compute"] = {"hpc": {"reach": "claude-code"}}
+        write_json(self.root / "science" / "policy.json", policy)
+        old = bridge.ssh_check
+        bridge.ssh_check = lambda host: (False, "`ssh hpc true` exited 255: ssh: Could not resolve hostname hpc: "
+                                                "nodename nor servname provided, or not known")
+        try:
+            code, out = run(["--project-dir", str(self.root), "compute-check"])
+        finally:
+            bridge.ssh_check = old
+        self.assertEqual(code, 1)
+        fix = out["checks"][0]["fix"]
+        self.assertIn("Host hpc", fix)
+        self.assertIn("~/.ssh/config", fix)
+        self.assertIn("ControlMaster", fix)
+
+    def test_compute_check_unreachable_host_says_to_check_the_network(self):
+        policy = read_json(self.root / "science" / "policy.json")
+        policy["compute"] = {"spark": {"reach": "claude-code"}}
+        write_json(self.root / "science" / "policy.json", policy)
+        old = bridge.ssh_check
+        for detail in ("`ssh spark true` exited 255: ssh: connect to host 100.64.0.9 port 22: Operation timed out",
+                       "no answer within 20 s"):
+            bridge.ssh_check = lambda host, d=detail: (False, d)
+            try:
+                code, out = run(["--project-dir", str(self.root), "compute-check"])
+            finally:
+                bridge.ssh_check = old
+            self.assertEqual(code, 1)
+            fix = out["checks"][0]["fix"]
+            self.assertIn("did not answer", fix)
+            self.assertIn("Tailscale", fix)
+            self.assertNotIn("to log in", fix)
 
 
 class ValidatorAdditions(unittest.TestCase):

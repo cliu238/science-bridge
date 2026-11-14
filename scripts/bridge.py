@@ -197,6 +197,12 @@ BRIEF_HEADING = "## Project brief"
 REQ_ID_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,7})-\d{2,3}\b")
 REQ_DEF_RE = re.compile(r"\*\*([A-Z][A-Z0-9]{1,7})-\d{2,3}\*\*")
 BRIEF_PLACEHOLDER = "<!-- Fill in: what the project is, what you want from Claude Science, key paths. -->"
+BRIEF_NOTES_LINE = "**Notes for Claude Science:** <!-- standing tasks, data caveats, anything else -->"
+# The auto-generated brief ends with this marker. Its digest tells `init` whether the brief is still unedited.
+AUTO_BRIEF_RE = re.compile(r"\s*<!-- science-bridge:auto-brief ([0-9a-f]{12})\b[^>]*-->\s*\Z")
+SSH_UNKNOWN_HOST = ("Could not resolve hostname", "nodename nor servname", "Name or service not known")
+SSH_UNREACHABLE = ("Operation timed out", "Connection timed out", "No route to host", "Network is unreachable",
+                   "Connection refused", "no answer within")
 SKILL_ZIP_SKIP = {"__pycache__", ".DS_Store"}
 # Claude Science names a newly uploaded skill after the zip's file name, and a name with dots (a version) is
 # refused, so the zip is always called this; its version is in SKILL.md.
@@ -746,8 +752,36 @@ def auto_brief(root: Path) -> str:
     prefixes = _requirement_prefixes(root)
     if prefixes:
         lines.append("**Requirement ID prefixes for `affects`:** " + prefixes)
-    lines.append("**Notes for Claude Science:** <!-- standing tasks, data caveats, anything else -->")
-    return "\n\n".join(lines)
+    lines.append(BRIEF_NOTES_LINE)
+    body = "\n\n".join(lines)
+    return ("%s\n\n<!-- science-bridge:auto-brief %s: `init` refills this brief from .planning/ until you edit it -->"
+            % (body, _brief_digest(body)))
+
+
+def _brief_digest(body: str) -> str:
+    return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def _refresh_auto_brief(root: Path, tail: str) -> Optional[str]:
+    """TAIL (README text after the managed block) with its Project brief regenerated from .planning/, or None.
+
+    Only a brief that is still unedited auto-generated text is regenerated: one whose auto-brief marker digest
+    matches, or the bare placeholder written before the marker existed (setup ran before GSD). A brief the user
+    edited is never touched."""
+    lines = tail.split("\n")
+    idx = next((i for i, line in enumerate(lines) if line.strip() == BRIEF_HEADING), None)
+    if idx is None:
+        return None
+    body = "\n".join(lines[idx + 1:]).strip()
+    m = AUTO_BRIEF_RE.search(body)
+    if m:
+        unedited = _brief_digest(body[:m.start()]) == m.group(1)
+    else:
+        unedited = body == BRIEF_PLACEHOLDER + "\n\n" + BRIEF_NOTES_LINE
+    fresh = auto_brief(root)
+    if not unedited or AUTO_BRIEF_RE.sub("", fresh).strip() == AUTO_BRIEF_RE.sub("", body).strip():
+        return None
+    return "\n".join(lines[:idx + 1]) + "\n\n" + fresh + "\n"
 
 
 def _legacy_brief(text: str) -> str:
@@ -803,8 +837,8 @@ def _readme_layout(text: str, root: Path) -> str:
 
 
 def sync_readme(root: Path) -> Tuple[str, Optional[str]]:
-    """Create science/README.md, refresh its managed block, or migrate a legacy README.
-    Returns (status, backup path of a migrated legacy README or None)."""
+    """Create science/README.md, refresh its managed block (and an unedited auto-generated brief), or migrate a
+    legacy README. Returns (status, backup path of a migrated legacy README or None)."""
     template = (TEMPLATES / "README.md").read_text(encoding="utf-8")
     tpl_parts = _split_managed(template)
     dst = root / "science" / "README.md"
@@ -815,13 +849,16 @@ def sync_readme(root: Path) -> Tuple[str, Optional[str]]:
     old = dst.read_text(encoding="utf-8")
     parts = _split_managed(old)
     if parts is not None:
-        if tpl_parts is None:
-            return "unchanged", None
-        new = parts[0] + _readme_layout(_render(tpl_parts[1], project_name=_project_name(root)), root) + parts[2]
+        block = parts[1] if tpl_parts is None else _readme_layout(
+            _render(tpl_parts[1], project_name=_project_name(root)), root)
+        tail = _refresh_auto_brief(root, parts[2])
+        new = parts[0] + block + (parts[2] if tail is None else tail)
         if new == old:
             return "unchanged", None
         _write_text_atomic(dst, new)
-        return "managed-block-updated", None
+        done = [s for s, changed in (("managed-block-updated", block != parts[1]), ("brief-updated", tail is not None))
+                if changed]
+        return "+".join(done), None
     name = _readme_title_name(old) or _project_name(root)
     brief = _legacy_brief(old) or auto_brief(root)
     backup = _unique_path(dst.with_name("README.md.bak"))
@@ -1100,9 +1137,19 @@ def compute_checks(policy: Dict[str, Any], selftest: Optional[Dict[str, Any]] = 
             continue
         if spec["reach"] == "claude-code":
             ok, detail = ssh_check(host)
-            checks.append(_check("compute:%s" % host, ok, "from Claude Code: %s" % detail,
-                                 "Run `! ssh %s` once in Claude Code to log in (Claude Code reuses that login), "
-                                 "then run /science-bridge:bridge compute-check." % host))
+            if any(s in detail for s in SSH_UNKNOWN_HOST):
+                fix = ("`%s` is not a host name this machine knows. Add a `Host %s` entry to ~/.ssh/config (HostName, "
+                       "User, and ControlMaster auto / ControlPath / ControlPersist so later commands reuse one "
+                       "login), or rename the host in science/policy.json `compute` to an ssh alias that exists. "
+                       "Then run `! ssh %s` once and /science-bridge:bridge compute-check." % (host, host, host))
+            elif any(s in detail for s in SSH_UNREACHABLE):
+                fix = ("`%s` did not answer. Check that the machine is on and that this computer can reach it "
+                       "(network, VPN such as Tailscale, firewall); logging in won't help until it answers. "
+                       "Then run /science-bridge:bridge compute-check." % host)
+            else:
+                fix = ("Run `! ssh %s` once in Claude Code to log in (Claude Code reuses that login), "
+                       "then run /science-bridge:bridge compute-check." % host)
+            checks.append(_check("compute:%s" % host, ok, "from Claude Code: %s" % detail, fix))
         elif selftest is not None:
             entry = reported.get(host)
             if entry is None:
