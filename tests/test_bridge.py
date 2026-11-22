@@ -1387,6 +1387,17 @@ class SelfTestAndVerify(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertTrue(self.selftest_path.exists() and (self.inbox / "selftest.md").exists())
 
+    def test_pick_selftest_falls_back_to_mtime_and_gsd_skill_ignores_it(self):
+        md, js = self.inbox / "selftest.md", self.selftest_path
+        write_json(js, {"format": bridge.SELFTEST_FORMAT, "created": "2026-11-20T00:00:00Z"})
+        self.write_md_selftest({"format": bridge.SELFTEST_FORMAT, "created": "not a time"})
+        os.utime(str(js), (1_000_000_000, 1_000_000_000))
+        path, data, error, older = bridge.pick_selftest(self.root)
+        self.assertEqual((path, older), (md, [js]), "an unparseable created: newest file by mtime counts")
+        os.utime(str(md), (900_000_000, 900_000_000))
+        self.assertEqual(bridge.pick_selftest(self.root)[0], js)
+        self.assertIn(b"ignore `selftest.md` and `selftest.json`", bridge.gsd_skill_bytes(self.root))
+
     def test_md_selftest_parsing(self):
         md = self.inbox / "selftest.md"
         md.write_text("# x\n\nsome words, then `inline` code\n\n```json\n{\"format\": \"f\", \"a\": [1, 2]}\n```\n"

@@ -1376,8 +1376,8 @@ def pick_selftest(root: Path) -> Tuple[Optional[Path], Optional[Dict[str, Any]],
             parsed.append((f, None, str(e), mtime))
         except Exception as e:  # e.g. a decode error; reported as a failed check, never a crash
             parsed.append((f, None, "%s: %s" % (type(e).__name__, e), mtime))
-    if all(d is not None and isinstance(d.get("created"), str) for _, d, _, _ in parsed):
-        parsed.sort(key=lambda t: (_obj(t[1]).get("created"), t[3]), reverse=True)
+    if all(d is not None and _parse_utc(d.get("created")) is not None for _, d, _, _ in parsed):
+        parsed.sort(key=lambda t: (_parse_utc(_obj(t[1]).get("created")), t[3]), reverse=True)
     else:
         parsed.sort(key=lambda t: t[3], reverse=True)
     path, data, error, _ = parsed[0]
@@ -1392,7 +1392,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if path is None:
         checks.append(_check("present", False, "science/inbox/%s (or %s) not found" % (SELFTEST_MD_NAME, SELFTEST_NAME),
                              FIX_SELFTEST + ' If it already ran and said "NOT DELIVERED YET", ask Claude Science to '
-                             "run the host.save_to_folder(...) line it printed, in its repl."))
+                             "run the host.save_to_folder(...) line it printed, in its repl. If that call fails, "
+                             "check that %s is granted Read & write." % (root / "science")))
     elif data is None:
         what = "has no valid ```json block" if path.name == SELFTEST_MD_NAME else "is not valid JSON"
         checks.append(_check("present", False, "science/inbox/%s %s: %s" % (path.name, what, error), FIX_SELFTEST))
@@ -1460,7 +1461,7 @@ def _last_selftest(root: Path) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------- GSD integration
 
 GSD_WS_EDITS = (
-    ("(template science-context v5)", "(template science-context v5, workstreams)"),
+    ("(template science-context v6)", "(template science-context v6, workstreams)"),
     ("1. **Read `science/archive/routing.jsonl`.** It has",
      "1. **Read `science/archive/routing-*.jsonl`** (one log per GSD workstream; also `routing.jsonl` if present). "
      "Each has"),

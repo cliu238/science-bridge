@@ -377,6 +377,8 @@ Claude Code runs a cached copy of the plugin, so the `update` step is required e
 
 The session-start hint tells you when the installed plugin is older than its source.
 
+**0.8.3** has GSD agents' science-context skill (template v6) ignore `selftest.md` as well as `selftest.json`; `setup` refreshes it.
+
 **0.8.2** fixes the self-test for Claude Science versions whose sandbox refuses direct writes to granted folders, even ones granted Read & write: with the skill (now 0.6.0), the self-test stages its result as `selftest.md` and Claude Science delivers it to `science/inbox/` with one `host.save_to_folder` call in its repl (`save_to_folder` refuses `.json`). `verify`, `status` and `wait` read `selftest.md` and the older `selftest.json`. Every project needs the new skill: run `setup` (it raises `skill_min_version` to 0.6.0), republish the zip from `cs-setup`, start a new Claude Science session and run the self-test again. The sentence to say is unchanged.
 
 **0.7.0** adds opt-in support for [projects with several GSD workstreams](#projects-with-several-gsd-workstreams) and the `requires`/`submit_via` host fields. A project that uses neither needs no action: `setup` leaves its files unchanged, and its Claude Science skill only has to be 0.4.0 or later, so republishing is optional. From this version on, `setup` raises `skill_min_version` only to what the project's features need, not to the bundled skill version. Auto-consult reminders are now de-duplicated per Claude Code session rather than per project.

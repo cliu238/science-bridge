@@ -4,7 +4,7 @@ description: For GSD agents (researchers, planners, checkers, executors, debugge
 disable-model-invocation: true
 ---
 
-<!-- Managed by science-bridge (template science-context v5). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
+<!-- Managed by science-bridge (template science-context v6). `bridge.py gsd-setup` overwrites this file; edit the template in the science-bridge repo instead. -->
 
 # Claude Science findings in this project
 
@@ -23,7 +23,7 @@ If the project has no `science/` folder, ignore this skill.
 3. **Read each relevant finding fully.** Read `## Summary` and `## Suggested action`, then `## Details` as needed. Also read any attachments listed in `sources` as `inbox/<name>`; after archiving they live at `science/archive/<name>`.
 4. **Use them as evidence and cite them.** Cite as `science/archive/<file>` with its `type` and `confidence`. On the same question, prefer a relevant finding over your own unverified assumption. If your research contradicts a finding, say so explicitly, give your evidence, and flag it for the user. Don't silently override it.
 5. **Planners: keep the link.** When a plan task implements something a finding proposed, put the finding path in the task's context or sources. That way the executor and verifier can trace why the task exists.
-6. **Mention unrouted findings, but don't rely on them.** If `science/inbox/` holds unrouted findings (`*.md`; ignore `selftest.json`), report their count and titles as "pending, unreviewed".
+6. **Mention unrouted findings, but don't rely on them.** If `science/inbox/` holds unrouted findings (`*.md`; ignore `selftest.md` and `selftest.json`, which are Claude Science's self-test), report their count and titles as "pending, unreviewed".
 7. **Use earlier runs.** `science/runs/<slug>/` holds outputs of compute jobs that Claude Code ran for Claude Science. Each has a `RUN.md` saying what was run. Cite them like findings.
 8. **Planners: compute proposals.** An `analysis-proposal` with `compute: <host>` has a `### Run spec`. A task that carries it out should:
    - say "run via `/science-bridge:bridge run science/archive/<file>`";
