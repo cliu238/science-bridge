@@ -61,7 +61,7 @@ If the arguments are not just a command and its options, read the user's intent.
 
 ## setup: set up or upgrade a project (idempotent)
 
-1. If `.planning/workstreams/` has workstreams and `policy.json` has no `workstreams` block, ask the user whether the workstreams run as separate sessions. If they do, ask which workstream owns findings that answer no queued question, and pass it as `init --workstreams-default <ws>`. That writes the block, raises `policy_version` to 4 (so older science-bridge versions refuse the policy instead of sharing one queue) and `skill_min_version` to 0.5.0. If they don't, write `"workstreams": {"enabled": false}` into `policy.json` to record that answer. Then run `init`. It never destroys user content:
+1. If `.planning/workstreams/` has workstreams and `policy.json` has no `workstreams` block, ask the user whether the workstreams run as separate sessions. If they do, ask which workstream owns findings that answer no queued question, and pass it as `init --workstreams-default <ws>`. That writes the block, raises `policy_version` to 4 (so older science-bridge versions refuse the policy instead of sharing one queue) and `skill_min_version` to at least 0.6.0. If they don't, write `"workstreams": {"enabled": false}` into `policy.json` to record that answer. Then run `init`. It never destroys user content:
    - **Creates** `science/{inbox,archive,outbox,runs}`, `policy.json` (v3) and `README.md`. The README's project brief is auto-filled from `.planning/PROJECT.md` and `REQUIREMENTS.md`.
    - **Upgrades** older policies to v3, keeping their values, and refreshes the README's managed block.
    - **Refills the brief** from `.planning/` while it is still the unedited auto-generated text (`readme: brief-updated`), for example when setup ran before `/gsd-new-project`, or after REQUIREMENTS.md gained new ID prefixes. A brief the user edited is never touched. So run `init` again after creating or changing `.planning/`.
@@ -122,9 +122,10 @@ Run `verify`. For every failed check, show its `fix` in plain words. Typical pro
 - repo not readable: the repo root isn't granted read-only;
 - repo writable: the repo root was granted read & write; it must be read-only;
 - old skill: republish the skill and start a new session;
+- `present` failed although Claude Science ran the self-test: its sandbox refuses direct writes. With skill 0.6.0+ the self-test says "NOT DELIVERED YET" and prints a `host.save_to_folder(...)` line; ask Claude Science to run that line in its repl, which delivers `science/inbox/selftest.md`. With an older skill, republish it (cs-setup) and run the self-test again;
 - a `claude-code` host isn't logged in: `! ssh <host>` once.
 
-When all checks pass, it archives the result as `science/archive/selftest-latest.json`. Offer to commit it.
+It reads `science/inbox/selftest.md` (JSON in a ```` ```json ```` block, from skill 0.6.0+) or the older `selftest.json`, the newer one if both are there. When all checks pass, it archives the result's JSON as `science/archive/selftest-latest.json` and removes the inbox copies. Offer to commit it.
 
 ## ask / requests: the question queue
 
@@ -149,7 +150,7 @@ Claude Science has no API, so you can't ask it whether it's done. But its result
 
    Then tell the user in one line that they don't need to watch, because you'll be notified when the files arrive. `wait` waits until the folder has been quiet for 20 s, so half-written files aren't picked up.
 2. **Exit 0 means something arrived.** Its JSON lists the files and `next`. Then:
-   - for `selftest.json`, run **verify**;
+   - for `selftest.md` or `selftest.json`, run **verify**;
    - for findings, run **ingest**. Use `--yes` only if the user pre-approved default routes.
 
    Don't report results before this notification arrives.

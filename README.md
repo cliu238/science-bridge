@@ -30,7 +30,7 @@ Claude Code + GSD is good at building software: it plans phases, researches, wri
   - the skill version;
   - repo and git readable;
   - repo root **not** writable;
-  - inbox writable;
+  - inbox writable (through Claude Science's `host.save_to_folder`, which is how files reach a granted folder when its sandbox refuses direct writes);
   - the same open questions on both sides;
   - compute reachable.
 
@@ -283,7 +283,7 @@ This writes to `science/policy.json`:
 
 ```json
 "policy_version": 4,
-"skill_min_version": "0.5.0",
+"skill_min_version": "0.6.0",
 "workstreams": {"enabled": true, "default": "<ws>", "queue": ".planning/workstreams/{ws}/questions.md"}
 ```
 
@@ -296,7 +296,7 @@ What changes:
 Limits:
 - `bridge.py` can't tell which workstream a session works on, so pass `--ws` (or set `$GSD_WORKSTREAM`). Without `$GSD_WORKSTREAM`, auto-consult reminders and the ask gate count every workstream's items, so a session can be reminded, or have a question held back once, because of another workstream's queue; each session acts only on its own. Start each session with `GSD_WORKSTREAM=<ws> claude` to avoid that.
 - A finding that answers questions of several workstreams can't be routed until Claude Science splits it. Until then, only the default workstream may reject it.
-- `policy_version` 4 makes science-bridge 0.6 and older refuse the policy instead of silently using one queue, and `skill_min_version` 0.5.0 does the same for older Claude Science skills. Everyone working on the repo needs science-bridge 0.7.0 or later.
+- `policy_version` 4 makes science-bridge 0.6 and older refuse the policy instead of silently using one queue, and `skill_min_version` 0.6.0 (0.5.0 before science-bridge 0.8.2) does the same for older Claude Science skills. Everyone working on the repo needs science-bridge 0.7.0 or later.
 
 To record that a project's workstreams don't run as separate sessions, write `"workstreams": {"enabled": false}`. Turning workstreams off again hides the per-workstream queues, so move their open items into `.planning/research/questions.md` first.
 
@@ -377,6 +377,8 @@ Claude Code runs a cached copy of the plugin, so the `update` step is required e
 
 The session-start hint tells you when the installed plugin is older than its source.
 
+**0.8.2** fixes the self-test for Claude Science versions whose sandbox refuses direct writes to granted folders, even ones granted Read & write: with the skill (now 0.6.0), the self-test stages its result as `selftest.md` and Claude Science delivers it to `science/inbox/` with one `host.save_to_folder` call in its repl (`save_to_folder` refuses `.json`). `verify`, `status` and `wait` read `selftest.md` and the older `selftest.json`. Every project needs the new skill: run `setup` (it raises `skill_min_version` to 0.6.0), republish the zip from `cs-setup`, start a new Claude Science session and run the self-test again. The sentence to say is unchanged.
+
 **0.7.0** adds opt-in support for [projects with several GSD workstreams](#projects-with-several-gsd-workstreams) and the `requires`/`submit_via` host fields. A project that uses neither needs no action: `setup` leaves its files unchanged, and its Claude Science skill only has to be 0.4.0 or later, so republishing is optional. From this version on, `setup` raises `skill_min_version` only to what the project's features need, not to the bundled skill version. Auto-consult reminders are now de-duplicated per Claude Code session rather than per project.
 
 ## Troubleshooting (all seen in real use)
@@ -391,6 +393,7 @@ The session-start hint tells you when the installed plugin is older than its sou
 | `sinfo: command not found` over ssh | A non-interactive shell has no SLURM or `module` on PATH. `run` uses a login shell (`bash -l`) |
 | New plugin behaviour doesn't show up | Run `claude plugin update …` (see Upgrading) and restart Claude Code |
 | `Unknown command: /science-bridge:bridge` | That Claude Code session started **before** the plugin was installed or updated, and plugins load only at session start. Open a new session in the project (`/exit`, then `claude`). Check with `claude plugin list` that science-bridge is enabled |
+| Self-test: `PermissionError: Operation not permitted` writing `science/inbox/`, or `save_to_folder` says `type_not_allowed` for `selftest.json` | Claude Science's sandbox refuses direct writes to granted folders and `save_to_folder` refuses `.json`. Update to science-bridge 0.8.2+ and skill 0.6.0+, where the self-test stages `selftest.md` and Claude Science delivers it with `host.save_to_folder`. Don't rename files to get around it |
 | Claude Code lists `anthropic-skills:science-findings` | The published Claude Science skill syncs into Claude Code. This is harmless, and its description points Claude Code to `/science-bridge:bridge` |
 
 ## Guarantees and limits

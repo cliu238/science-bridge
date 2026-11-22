@@ -16,9 +16,10 @@ Commands:
                                     an ordered checklist
   skill-zip [--out ZIP]             build the Claude Science skill zip (top folder
                                     science-findings/); default <tmp>/science-bridge/<ver>/science-findings.zip
-  verify [--max-age-hours N]        check science/inbox/selftest.json (written by the Claude
-                                    Science self-test) against this repo and policy.json; exit 1
-                                    on any failed check; on success move it to
+  verify [--max-age-hours N]        check science/inbox/selftest.md (or the older selftest.json;
+                                    the newer one if both are there), written by the Claude
+                                    Science self-test, against this repo and policy.json; exit 1
+                                    on any failed check; on success archive its JSON as
                                     science/archive/selftest-latest.json
   compute-check                     ssh check of every policy.json compute host with reach
                                     "claude-code"; exit 1 if one is unreachable
@@ -172,19 +173,28 @@ ROUTES = ("note", "todo", "seed", "manual", "rejected")
 OUTBOX_RESERVED = {"MANIFEST.json", ".gitkeep"}
 EXPORT_REPO_READONLY = ("%s: Claude Science reads repo files directly in repo-readonly mode; export is only for "
                         "files outside the repo")
+# Claude Science's sandbox may refuse direct writes to granted folders; files then reach the inbox only through
+# host.save_to_folder, which refuses .json. So skill 0.6.0+ delivers the self-test as selftest.md (a sentence for
+# people plus the same JSON in a ```json block); older skills, and sandboxes that allow direct writes, still write
+# selftest.json. Both are read; when both are there, the newer one counts.
 SELFTEST_NAME = "selftest.json"
+SELFTEST_MD_NAME = "selftest.md"
+SELFTEST_NAMES = (SELFTEST_MD_NAME, SELFTEST_NAME)
 SELFTEST_LATEST = "selftest-latest.json"
 SELFTEST_FORMAT = "science-bridge-selftest/v1"
-INBOX_IGNORED = {".gitkeep", "README.md", SELFTEST_NAME, ".selftest-probe"}
+SELFTEST_JSON_BLOCK_RE = re.compile(r"^```json[ \t]*\n(.*?)^```[ \t]*$", re.S | re.M)
+INBOX_IGNORED = {".gitkeep", "README.md", SELFTEST_NAME, SELFTEST_MD_NAME, ".selftest-probe"}
 
 POLICY_VERSION = 3        # what init writes and migrates older policies to
 WS_POLICY_VERSION = 4     # a policy with workstreams on: older science-bridge versions refuse it instead of
 POLICY_VERSION_MAX = 4    # silently using one shared queue
 # The Claude Science skill version each feature needs. init raises skill_min_version only to what the project
 # uses, so a skill release that adds an opt-in feature doesn't make every project republish the skill. Raise
-# BASE_SKILL_VERSION when a skill change must reach every project.
-BASE_SKILL_VERSION = "0.4.0"
-WS_SKILL_VERSION = "0.5.0"
+# BASE_SKILL_VERSION when a skill change must reach every project. 0.6.0 must: it delivers the self-test through
+# host.save_to_folder, the only way into science/inbox/ when Claude Science's sandbox refuses direct writes.
+# Workstreams first needed 0.5.0; no feature may need less than the base.
+BASE_SKILL_VERSION = "0.6.0"
+WS_SKILL_VERSION = "0.6.0"
 EXPORT_DEFAULTS = (("allowed_sources", []), ("allowed_extensions", []), ("check_command", None), ("max_file_mb", 50))
 EXPORT_KEYS = tuple(k for k, _ in EXPORT_DEFAULTS)
 COMPUTE_REACH = ("claude-code", "claude-science")
@@ -1273,7 +1283,7 @@ def selftest_checks(root: Path, policy: Dict[str, Any], data: Dict[str, Any], ma
     checks = []
     fmt = data.get("format")
     checks.append(_check("format", fmt == SELFTEST_FORMAT, "format %r" % (fmt,),
-                         "selftest.json was not written by the skill's scripts/selftest.py. " + FIX_SELFTEST))
+                         "the self-test file was not written by the skill's scripts/selftest.py. " + FIX_SELFTEST))
     created = _parse_utc(data.get("created"))
     if created is None:
         checks.append(_check("fresh", False, "created is missing or not an ISO time: %r" % (data.get("created"),),
@@ -1327,33 +1337,92 @@ def selftest_checks(root: Path, policy: Dict[str, Any], data: Dict[str, Any], ma
     return checks
 
 
+def parse_selftest(path: Path) -> Dict[str, Any]:
+    """The self-test JSON from selftest.json, or from the first ```json block of selftest.md.
+    Raises OSError or ValueError."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".md":
+        m = SELFTEST_JSON_BLOCK_RE.search(text)
+        if m is None:
+            raise ValueError("no ```json block")
+        text = m.group(1)
+    loaded = json.loads(text)
+    if not isinstance(loaded, dict):
+        raise ValueError("not a JSON object")
+    return loaded
+
+
+def selftest_files(root: Path) -> List[Path]:
+    inbox = root / "science" / "inbox"
+    return [inbox / n for n in SELFTEST_NAMES if (inbox / n).is_file()]
+
+
+def pick_selftest(root: Path) -> Tuple[Optional[Path], Optional[Dict[str, Any]], Optional[str], List[Path]]:
+    """The self-test result to check: (path, data or None, parse error or None, superseded files).
+    With both selftest.md and selftest.json present, the newer one counts: by "created" when both parse,
+    otherwise by modification time."""
+    files = selftest_files(root)
+    if not files:
+        return None, None, None, []
+    parsed = []  # type: List[Tuple[Path, Optional[Dict[str, Any]], Optional[str], float]]
+    for f in files:
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        try:
+            parsed.append((f, parse_selftest(f), None, mtime))
+        except (OSError, ValueError) as e:
+            parsed.append((f, None, str(e), mtime))
+        except Exception as e:  # e.g. a decode error; reported as a failed check, never a crash
+            parsed.append((f, None, "%s: %s" % (type(e).__name__, e), mtime))
+    if all(d is not None and isinstance(d.get("created"), str) for _, d, _, _ in parsed):
+        parsed.sort(key=lambda t: (_obj(t[1]).get("created"), t[3]), reverse=True)
+    else:
+        parsed.sort(key=lambda t: t[3], reverse=True)
+    path, data, error, _ = parsed[0]
+    return path, data, error, [t[0] for t in parsed[1:]]
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     root = require_project(args.project_dir)
     policy = load_policy(root)
-    path = root / "science" / "inbox" / SELFTEST_NAME
+    path, data, error, superseded = pick_selftest(root)
     checks = []
-    data = None  # type: Optional[Dict[str, Any]]
-    if not path.is_file():
-        checks.append(_check("present", False, "science/inbox/%s not found" % SELFTEST_NAME, FIX_SELFTEST))
+    if path is None:
+        checks.append(_check("present", False, "science/inbox/%s (or %s) not found" % (SELFTEST_MD_NAME, SELFTEST_NAME),
+                             FIX_SELFTEST + ' If it already ran and said "NOT DELIVERED YET", ask Claude Science to '
+                             "run the host.save_to_folder(...) line it printed, in its repl."))
+    elif data is None:
+        what = "has no valid ```json block" if path.name == SELFTEST_MD_NAME else "is not valid JSON"
+        checks.append(_check("present", False, "science/inbox/%s %s: %s" % (path.name, what, error), FIX_SELFTEST))
     else:
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(loaded, dict):
-                raise ValueError("not a JSON object")
-            data = loaded
-            checks.append(_check("present", True, "science/inbox/%s" % SELFTEST_NAME))
-        except (OSError, ValueError) as e:
-            checks.append(_check("present", False, "science/inbox/%s is not valid JSON: %s" % (SELFTEST_NAME, e),
-                                 FIX_SELFTEST))
+        detail = "science/inbox/%s" % path.name
+        if superseded:
+            detail += " (newer than %s)" % ", ".join(p.name for p in superseded)
+        checks.append(_check("present", True, detail))
     if data is not None:
         checks.extend(selftest_checks(root, policy, data, args.max_age_hours))
     ok = all(c["ok"] for c in checks)
     out = {"ok": ok, "checks": checks}  # type: Dict[str, Any]
-    if ok:
+    if ok and path is not None and data is not None:
         archive = root / "science" / "archive"
         archive.mkdir(exist_ok=True)
-        os.replace(str(path), str(archive / SELFTEST_LATEST))
+        if path.name == SELFTEST_NAME:
+            os.replace(str(path), str(archive / SELFTEST_LATEST))
+        else:
+            _write_text_atomic(archive / SELFTEST_LATEST, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            path.unlink()
         out["archived"] = "science/archive/%s" % SELFTEST_LATEST
+        removed = []
+        for old in superseded:  # an older self-test result is of no further use
+            try:
+                old.unlink()
+                removed.append("science/inbox/%s" % old.name)
+            except OSError:
+                pass
+        if removed:
+            out["removed_older"] = removed
     else:
         out["failed"] = [c["name"] for c in checks if not c["ok"]]
     _emit(out)
@@ -1996,7 +2065,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "requests_open": [r for r in list_requests(root, policy, ws) if r["open"]],
         "consult": {k: v for k, v in consult_report(root, policy, probe=False, ws=ws).items()
                     if k in ("auto", "deliver", "wait_minutes", "ask_gate", "unsent", "sent_awaiting")},
-        "selftest_pending": (root / "science" / "inbox" / SELFTEST_NAME).is_file(),
+        "selftest_pending": bool(selftest_files(root)),
         "last_selftest": _last_selftest(root),
         **extra,
     })
@@ -2162,9 +2231,10 @@ def _hint_legacy_policy(root: Path) -> Optional[str]:
 
 
 def _hint_selftest(root: Path) -> Optional[str]:
-    if (root / "science" / "inbox" / SELFTEST_NAME).is_file():
+    waiting = selftest_files(root)
+    if waiting:
         return ("[science-bridge] Claude Science's self-test result is waiting in science/inbox/%s; run "
-                "/science-bridge:bridge verify." % SELFTEST_NAME)
+                "/science-bridge:bridge verify." % waiting[0].name)
     last = _last_selftest(root)
     need = max(required_skill_version(load_policy(root)), load_policy(root)["skill_min_version"], key=vtuple)
     if last is None or vtuple(last.get("skill_version")) < vtuple(need):
@@ -2271,7 +2341,7 @@ def _arrivals(before: Dict[str, Tuple[int, float]], now: Dict[str, Tuple[int, fl
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
-    """Block until Claude Science writes something to science/inbox/ (a finding or selftest.json), then wait
+    """Block until Claude Science writes something to science/inbox/ (a finding or the self-test), then wait
     until the folder has been quiet for --settle seconds so half-written files are not picked up.
 
     Claude Science has no API, so this watches files only. Run it in the background from Claude Code; exit 0 =
@@ -2286,7 +2356,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
     def wanted(name: str) -> bool:
         """With --ws, only the self-test and this workstream's findings end the wait."""
-        if name == SELFTEST_NAME:
+        if name in SELFTEST_NAMES:
             return True
         if not name.endswith(".md"):
             return False
@@ -2326,7 +2396,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
             last, quiet_since = now, time.time()
     inb = _inbox_report(root)
     findings = [_pending_entry(f) for f in _for_ws(inb["findings"], ws, default)]
-    selftest = (root / "science" / "inbox" / SELFTEST_NAME).is_file()
+    selftest = bool(selftest_files(root))
     nxt = []
     if selftest:
         nxt.append("/science-bridge:bridge verify")

@@ -13,7 +13,8 @@ This document defines the shared handoff format between a Claude Code (+ GSD) pr
 │   │                    written only by `bridge.py export`
 │   │   └── MANIFEST.json  every exported file: name, sha256, bytes, source, exported_at
 │   ├── inbox/           Claude Science → project. One markdown finding per file,
-│   │                    plus selftest.json while a self-test waits for `bridge.py verify`
+│   │                    plus selftest.md (or selftest.json) while a self-test waits for
+│   │                    `bridge.py verify`
 │   ├── archive/         findings already routed into GSD, routing.jsonl, selftest-latest.json
 │   └── runs/            outputs of jobs Claude Code ran for Claude Science (one folder per finding slug)
 └── .planning/research/questions.md
@@ -188,13 +189,17 @@ Run the bootstrap on hpc and report the CI table.
 
 Claude Code turns this into a GSD todo. When it is executed, the outputs are committed under `science/runs/<slug>/`. Claude Science reads them there and writes a follow-up finding with `builds_on: [science/runs/<slug>/]`.
 
-## Self-test file (`inbox/selftest.json`)
+## Self-test file (`inbox/selftest.md`, or `inbox/selftest.json`)
 
-`scripts/selftest.py` writes it, and `bridge.py verify` checks it against the real repo, then moves it to `archive/selftest-latest.json`. The format is `science-bridge-selftest/v1`, with these fields:
+`scripts/selftest.py` produces it:
+- **`selftest.json`**, written directly, when the sandbox lets code write `science/inbox/` (older Claude Science).
+- **`selftest.md`** otherwise: the script stages it in the workspace, and a `host.save_to_folder` call in the repl copies it into the inbox (`save_to_folder` refuses `.json`). The file is a sentence or two for people, then the same JSON in a ```` ```json ```` block.
+
+`bridge.py verify` reads either (the newer one if both are there), checks it against the real repo, then archives its JSON as `archive/selftest-latest.json` and removes the inbox copy. The JSON format is `science-bridge-selftest/v1`, with these fields:
 - `skill_version` and `policy`;
 - `repo`: `git_head`, `tracked_files` and a probe file's sha256;
 - `write_probe_repo_root` (must be `denied`);
-- `inbox_write` (must be `ok`);
+- `inbox_write` (must be `ok`; in `selftest.md` it is `ok` because only a successful `save_to_folder` call puts the file there);
 - `requests_open`;
 - `compute` results.
 

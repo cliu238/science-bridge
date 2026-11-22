@@ -92,6 +92,39 @@ def read_json(path):
     return json.loads(Path(path).read_text())
 
 
+class FakeHost:
+    """Claude Science's host.save_to_folder as seen in 0.1.73: it copies one workspace file into a folder granted
+    rw (which code in the sandbox can't write itself), refuses .json, and replaces an existing file only when
+    replaces= is that file's sha256."""
+
+    def __init__(self, refuse=False):
+        self.refuse = refuse
+        self.calls = []
+
+    def save_to_folder(self, src, dest, overwrite=False, replaces=None, ask=False):
+        import hashlib
+        self.calls.append({"src": src, "dest": dest, "overwrite": overwrite, "replaces": replaces})
+        src, dest = Path(src), Path(dest)
+        if self.refuse or src.suffix.lower() in (".json", ".yaml", ".toml", ".xml", ".zip", ".pkl"):
+            raise RuntimeError("host_call 'save_to_folder' failed: not saved [type_not_allowed]: only data files "
+                               "... are copied")
+        target = dest / src.name if dest.is_dir() else dest
+        existed = target.exists()
+        if existed and replaces != hashlib.sha256(target.read_bytes()).hexdigest():
+            raise RuntimeError("host_call 'save_to_folder' failed: not saved [dest_not_yours]")
+        if not existed and replaces:
+            raise RuntimeError("host_call 'save_to_folder' failed: not saved [dest_changed]")
+        data = src.read_bytes()
+        mode = target.parent.stat().st_mode
+        os.chmod(str(target.parent), 0o755)  # the host, not the sandbox, writes
+        try:
+            target.write_bytes(data)
+        finally:
+            os.chmod(str(target.parent), stat.S_IMODE(mode))
+        return {"saved": str(target), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                "replaced": existed, "created_folders": []}
+
+
 def confirm_skill(root, version=None):
     """Pretend Claude Science already passed a self-test with the bundled skill."""
     write_json(Path(root) / "science" / "archive" / "selftest-latest.json",
@@ -663,6 +696,11 @@ class SessionHint(unittest.TestCase):
         out = self.hint(root)
         self.assertIn("run /science-bridge:bridge verify", out)
         self.assertNotIn("finding(s) waiting", out, "selftest.json is not a finding")
+        (root / "science" / "inbox" / "selftest.json").unlink()
+        (root / "science" / "inbox" / "selftest.md").write_text("# self-test\n\n```json\n{}\n```\n")
+        out = self.hint(root)
+        self.assertIn("waiting in science/inbox/selftest.md; run /science-bridge:bridge verify", out)
+        self.assertNotIn("finding(s) waiting", out, "selftest.md is not a finding")
         write_json(root / "science" / "policy.json", V2_POLICY)
         self.assertIn("run /science-bridge:bridge init to upgrade science/ (policy v3)", self.hint(root))
 
@@ -1223,6 +1261,151 @@ class SelfTestAndVerify(unittest.TestCase):
         self.assertIn("skipped", out["repo"]["error"])
         self.assertNotIn("Traceback", proc.stdout + proc.stderr)
 
+    def selftest_sandboxed(self, *extra, cwd=None, expect=3):
+        """Run the self-test the way the new Claude Science sandbox allows: the repo root and science/inbox/ are
+        read-only to the script, and its current directory is the workspace. Returns (JSON, the text after it)."""
+        workspace = Path(cwd) if cwd else Path(tempfile.mkdtemp()).resolve()
+        os.chmod(str(self.inbox), 0o555)
+        os.chmod(str(self.root), 0o555)
+        try:
+            proc = subprocess.run([sys.executable, str(SELFTEST), str(self.root)] + list(extra), capture_output=True,
+                                  text=True, timeout=60, cwd=str(workspace))
+        finally:
+            os.chmod(str(self.root), 0o755)
+            os.chmod(str(self.inbox), 0o755)
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        body, sep, tail = proc.stdout.partition("\nNOT DELIVERED YET.")
+        return json.loads(body), (sep + tail), workspace
+
+    def repl_call(self, tail):
+        """The host.save_to_folder(...) line the self-test printed, as (src, dest, kwargs)."""
+        line = next(l for l in tail.splitlines() if l.startswith("host.save_to_folder("))
+        args = json.loads("[" + line[len("host.save_to_folder("):-1].split(", replaces=")[0] + "]")
+        kwargs = {}
+        if ", replaces=" in line:
+            kwargs["replaces"] = json.loads(line.split(", replaces=")[1][:-1])
+        return args[0], args[1], kwargs
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_sandbox_stages_md_then_repl_delivers_it_and_verify_archives_its_json(self):
+        printed, tail, workspace = self.selftest_sandboxed()
+        staged = workspace / "science-bridge-selftest" / "selftest.md"
+        self.assertTrue(staged.is_file())
+        self.assertFalse((self.inbox / "selftest.md").exists())
+        self.assertFalse(self.selftest_path.exists())
+        self.assert_no_probes()
+        self.assertIn("running this in the repl", tail)
+        self.assertIn("/science-bridge:bridge verify", tail)
+        src, dest, kwargs = self.repl_call(tail)
+        self.assertEqual((Path(src), Path(dest), kwargs), (staged, self.inbox, {}))
+        text = staged.read_text()
+        self.assertTrue(text.startswith("# science-bridge self-test\n"))
+        self.assertIn("/science-bridge:bridge verify", text.split("```json")[0])
+        data = bridge.parse_selftest(staged)
+        self.assertEqual(data, printed)
+        self.assertEqual((data["inbox_write"], data["write_probe_repo_root"]), ("ok", "denied"))
+        self.assertEqual(data["requests_open"], ["SQ-001"])
+        self.assertEqual(data["errors"], [])
+        self.assertEqual(sorted(data), sorted(["format", "created", "skill_version", "python", "root", "policy",
+                                               "repo", "write_probe_repo_root", "inbox_write", "requests_open",
+                                               "requests_error", "compute", "errors"]), "fields unchanged")
+        code, out = self.verify()
+        self.assertEqual((code, out["failed"]), (1, ["present"]), "nothing arrives until the repl call runs")
+
+        fake = FakeHost()  # the repl step
+        self.assertEqual(fake.save_to_folder(src, dest, **kwargs)["saved"], str(self.inbox / "selftest.md"))
+        with self.assertRaises(RuntimeError):  # what the sandbox refuses: .json
+            fake.save_to_folder(str(self.inbox / "x.json"), dest)
+
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertTrue(out["selftest_pending"])
+        self.assertEqual((out["pending"], out["attachments"]), ([], []), "selftest.md is not a finding")
+        code, out = run(["--project-dir", str(self.root), "check"])
+        self.assertEqual(code, 0, out)
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["checks"][0]["detail"], "science/inbox/selftest.md")
+        self.assertFalse((self.inbox / "selftest.md").exists())
+        latest = self.root / "science" / "archive" / "selftest-latest.json"
+        self.assertEqual(read_json(latest), data)
+        code, out = run(["--project-dir", str(self.root), "status"])
+        self.assertFalse(out["selftest_pending"])
+        self.assertEqual(out["last_selftest"]["skill_version"], bridge.SKILL_VERSION)
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_sandbox_rerun_replaces_an_earlier_unverified_md(self):
+        import hashlib
+        fake = FakeHost()
+        _, tail, workspace = self.selftest_sandboxed()
+        fake.save_to_folder(*self.repl_call(tail)[:2])
+        first = (self.inbox / "selftest.md").read_bytes()
+        _, tail, _ = self.selftest_sandboxed("--compute", "lab=skipped:no VPN", cwd=workspace)
+        src, dest, kwargs = self.repl_call(tail)
+        self.assertEqual(kwargs, {"replaces": hashlib.sha256(first).hexdigest()})
+        fake.save_to_folder(src, dest, **kwargs)
+        data = bridge.parse_selftest(self.inbox / "selftest.md")
+        self.assertEqual(data["compute"], [{"name": "lab", "result": "skipped", "detail": "no VPN"}])
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_sandbox_run_from_the_skill_or_repo_folder_cannot_stage(self):
+        for where, name in ((SKILL_SCRIPTS.parent, "skill's folder"), (self.root / "science", "the repo")):
+            printed, tail, _ = self.selftest_sandboxed(cwd=where, expect=1)
+            self.assertEqual(tail, "")
+            self.assertEqual(printed["inbox_write"], "denied")
+            self.assertTrue(any(name in e and "workspace" in e for e in printed["errors"]), printed["errors"])
+        self.assertFalse((SKILL_SCRIPTS.parent / "science-bridge-selftest").exists())
+
+    def write_md_selftest(self, data, name="selftest.md"):
+        (self.inbox / name).write_text("# science-bridge self-test\n\nRun verify.\n\n```json\n%s\n```\n"
+                                      % json.dumps(data, indent=2))
+
+    @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
+    def test_verify_uses_the_newer_of_md_and_json(self):
+        data = self.selftest()  # fresh selftest.json
+        old = dict(data, created=(_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=9))
+                   .replace(microsecond=0).isoformat().replace("+00:00", "Z"), skill_version="0.4.0")
+        self.write_md_selftest(old)  # an older result as .md, written later
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["checks"][0]["detail"], "science/inbox/selftest.json (newer than selftest.md)")
+        self.assertEqual(out["removed_older"], ["science/inbox/selftest.md"])
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir() if p.name.startswith("selftest")), [])
+
+        # the other way round: the new skill's selftest.md beside an old account's selftest.json
+        write_json(self.selftest_path, old)
+        self.write_md_selftest(data)
+        code, out = self.verify()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["checks"][0]["detail"], "science/inbox/selftest.md (newer than selftest.json)")
+        self.assertEqual(out["removed_older"], ["science/inbox/selftest.json"])
+        self.assertEqual(read_json(self.root / "science" / "archive" / "selftest-latest.json"), data)
+
+        # a failed verify (both stale here) keeps both
+        write_json(self.selftest_path, old)
+        self.write_md_selftest(old)
+        code, out = self.verify()
+        self.assertEqual(code, 1)
+        self.assertTrue(self.selftest_path.exists() and (self.inbox / "selftest.md").exists())
+
+    def test_md_selftest_parsing(self):
+        md = self.inbox / "selftest.md"
+        md.write_text("# x\n\nsome words, then `inline` code\n\n```json\n{\"format\": \"f\", \"a\": [1, 2]}\n```\n"
+                      "\n```json\n{\"second\": true}\n```\n")
+        self.assertEqual(bridge.parse_selftest(md), {"format": "f", "a": [1, 2]}, "the first json block counts")
+        md.write_text("# x\n\n```\n{}\n```\n")
+        with self.assertRaises(ValueError):
+            bridge.parse_selftest(md)
+        md.write_text("```json\n[1, 2]\n```\n")
+        with self.assertRaises(ValueError):
+            bridge.parse_selftest(md)
+        md.write_text("```json\n{broken\n```\n")
+        code, out = self.verify()
+        self.assertEqual((code, out["failed"]), (1, ["present"]))
+        self.assertIn("selftest.md has no valid ```json block", out["checks"][0]["detail"])
+        md.unlink()
+        code, out = self.verify()
+        self.assertIn("selftest.md (or selftest.json) not found", out["checks"][0]["detail"])
+
     @unittest.skipIf(IS_ROOT, "root ignores directory permissions")
     def test_compute_hosts(self):
         policy = read_json(self.root / "science" / "policy.json")
@@ -1442,11 +1625,14 @@ class WaitForInbox(unittest.TestCase):
         self.assertEqual(code, 2, out)
 
     def test_selftest_arrival_points_to_verify(self):
-        (self.inbox / "selftest.json").write_text("{}")
-        code, out = run(["--project-dir", str(self.root), "wait", "--timeout", "5", "--settle", "0.5"])
-        self.assertEqual(code, 0, out)
-        self.assertTrue(out["selftest_waiting"])
-        self.assertEqual(out["next"], ["/science-bridge:bridge verify"])
+        for name in ("selftest.json", "selftest.md"):
+            (self.inbox / name).write_text("{}")
+            code, out = run(["--project-dir", str(self.root), "wait", "--timeout", "5", "--settle", "0.5"])
+            self.assertEqual(code, 0, out)
+            self.assertTrue(out["selftest_waiting"])
+            self.assertEqual(out["next"], ["/science-bridge:bridge verify"], "%s is not a finding" % name)
+            self.assertEqual(out["findings"], [])
+            (self.inbox / name).unlink()
 
 
 class AutoConsult(unittest.TestCase):

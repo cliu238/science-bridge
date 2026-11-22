@@ -2,24 +2,38 @@
 """science-bridge self-test. Claude Science runs it inside its sandbox.
 
 Standard library only, Python 3.8+. It records what this Claude Science project can see and do
-in a science-bridge repo and writes the result to <repo-root>/science/inbox/selftest.json, which
-`/science-bridge:bridge verify` checks on the Claude Code side.
+in a science-bridge repo, for `/science-bridge:bridge verify` to check on the Claude Code side.
 
-Usage:
+Usage (from a shell in Claude Science, with the workspace as the current directory):
     python3 scripts/selftest.py <repo-root> [--compute NAME=ok|failed|skipped[:detail] ...]
 
 --compute reports the result of testing one policy.json compute host with reach
 "claude-science" (repeat it per host).
 
+How the result reaches science/inbox/:
+  - If this process may write science/inbox/ (older Claude Science), it writes
+    science/inbox/selftest.json directly, as it always did. Exit code 0.
+  - If the sandbox refuses direct writes to granted folders (even ones granted Read & write), it
+    stages science-bridge-selftest/selftest.md in the current (workspace) directory and prints
+    the one host.save_to_folder call that delivers it. Run that call in the repl, where `host`
+    lives (the repl itself can't read the repo, so the checks run here). Exit code 3.
+    selftest.md is a sentence for people plus the same JSON in a ```json block, because
+    save_to_folder refuses .json. Its inbox_write is "ok": the file can only reach the inbox
+    through a save_to_folder call that succeeded; if the call fails, nothing arrives and
+    `verify` reports the self-test as missing.
+
 Guarantees:
   - never opens a path that matches policy.json "do_not_read" (when policy.json cannot be read,
     it reads nothing else in the repo);
-  - writes only science/inbox/selftest.json plus two probe files that it deletes again:
-    <repo-root>/.science-bridge-write-probe (creating it should be refused) and
-    science/inbox/.selftest-probe;
+  - writes in the repo only science/inbox/selftest.json plus two probe files that it deletes
+    again: <repo-root>/.science-bridge-write-probe (creating it should be refused) and
+    science/inbox/.selftest-probe; outside the repo, only the staged
+    science-bridge-selftest/selftest.md in the current directory;
   - never raises: every problem is recorded in the JSON.
 
-Prints the JSON. Exit code: 0 if selftest.json was written, 1 if not, 2 on usage error.
+Prints the JSON (and, when staged, the save_to_folder call after it). Exit code: 0 if
+selftest.json was written, 3 if selftest.md was staged for host.save_to_folder, 1 if neither,
+2 on usage error.
 """
 
 import datetime as _dt
@@ -46,6 +60,10 @@ WS_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PROBE_REL = ".planning/PROJECT.md"
 ROOT_PROBE = ".science-bridge-write-probe"
 INBOX_PROBE = ".selftest-probe"
+JSON_NAME = "selftest.json"
+MD_NAME = "selftest.md"
+STAGE_DIR = "science-bridge-selftest"  # in the current (workspace) directory
+EXIT_STAGED = 3
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 COMPUTE_RESULTS = ("ok", "failed", "skipped")
 DENIED_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
@@ -346,6 +364,48 @@ def run(root_arg: str, compute_specs: List[str], errors: List[str]) -> Dict[str,
     }
 
 
+def render_md(result: Dict[str, Any]) -> str:
+    return ("# science-bridge self-test\n\n"
+            "Claude Science ran the science-bridge self-test on %s (skill %s) and delivered this file with "
+            "host.save_to_folder. In Claude Code, run `/science-bridge:bridge verify`: it checks the JSON below "
+            "against the repo.\n\n"
+            "```json\n%s\n```\n" % (result.get("created"), result.get("skill_version"),
+                                      json.dumps(result, ensure_ascii=False, indent=2)))
+
+
+def stage_md(root: Path, result: Dict[str, Any], errors: List[str]) -> Optional[str]:
+    """Stage selftest.md in the workspace for host.save_to_folder. Returns the call to run in the repl, or None
+    (with the reason in errors)."""
+    cwd = Path(os.getcwd()).resolve()
+    for name, place in (("this skill's folder", Path(__file__).resolve().parent.parent), ("the repo", root)):
+        if cwd == place or place in cwd.parents:
+            errors.append("cannot stage %s: the current directory is inside %s; run the self-test from your "
+                          "workspace (don't cd elsewhere first)" % (MD_NAME, name))
+            return None
+    inbox = root / "science" / "inbox"
+    replaces = None  # type: Optional[str]
+    try:
+        if (inbox / MD_NAME).is_file():  # an earlier, unverified run: replace exactly that file
+            replaces = _sha256(inbox / MD_NAME)
+    except Exception as e:
+        errors.append("cannot read the existing science/inbox/%s: %s" % (MD_NAME, _err(e)))
+        return None
+    result["inbox_write"] = "ok"  # true of every copy that reaches the inbox; see the module docstring
+    try:
+        stage = cwd / STAGE_DIR
+        stage.mkdir(exist_ok=True)
+        src = stage / MD_NAME
+        src.write_text(render_md(result), encoding="utf-8")
+    except Exception as e:
+        result["inbox_write"] = "denied"
+        errors.append("could not stage %s in the workspace: %s" % (MD_NAME, _err(e)))
+        return None
+    call = "host.save_to_folder(%s, %s" % (json.dumps(str(src)), json.dumps(str(inbox)))
+    if replaces:
+        call += ", replaces=%s" % json.dumps(replaces)
+    return call + ")"
+
+
 def main(argv: List[str]) -> int:
     try:
         root_arg = None  # type: Optional[str]
@@ -377,15 +437,25 @@ def main(argv: List[str]) -> int:
             return 2
 
         result = run(root_arg, computes, errors)
-        out_path = Path(result["root"]) / "science" / "inbox" / "selftest.json"
-        written = False
+        root = Path(result["root"])
+        out_path = root / "science" / "inbox" / JSON_NAME
+        call = None  # type: Optional[str]
         try:
             out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            written = True
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         except Exception as e:
-            errors.append("could not write %s: %s" % (out_path, _err(e)))
+            if isinstance(e, OSError) and e.errno in DENIED_ERRNOS and result.get("inbox_write") == "denied":
+                call = stage_md(root, result, errors)  # the sandbox refuses direct writes: hand over via host
+            if call is None:
+                errors.append("could not write %s: %s" % (out_path, _err(e)))
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if written else 1
+        if call is None:
+            return 1
+        print("\nNOT DELIVERED YET. This sandbox refuses direct writes to science/inbox/, so the result was staged "
+              "as %s/%s. Deliver it by running this in the repl (where `host` is defined):\n\n%s\n\nThen tell the "
+              "user to run /science-bridge:bridge verify in Claude Code." % (STAGE_DIR, MD_NAME, call))
+        return EXIT_STAGED
     except Exception as e:  # never raise
         try:
             print(json.dumps({"format": FORMAT, "created": _now(), "errors": ["self-test crashed: " + _err(e)]}))
